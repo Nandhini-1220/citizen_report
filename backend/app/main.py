@@ -1,30 +1,32 @@
 import os
-import uuid
-import shutil
-import random
+import io
 import tempfile
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 
-from app.database import engine, get_db, Base
-from app.models import Department, Complaint, CallerSubscriber, SMSLog
+from app.database import engine, SessionLocal, Base, get_db
+from app.models import Complaint, Department, CallerSubscriber, SMSLog
 from app.services.stt_service import transcribe_and_translate_audio
 from app.services.llm_service import extract_complaint_intelligence
-from app.services.dedupe_service import find_duplicate_complaint, index_new_complaint
+from app.services.dedupe_service import find_duplicate_complaint, index_new_complaint, clear_and_rebuild_index
 from app.services.sms_service import send_sms_notification
 
-# Auto-create all tables in SQLite database
+# Initialize database schema
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="AI Citizen Intelligence Platform API")
+app = FastAPI(title="Municipal Voice AI Grievance Platform")
 
-# Configure CORS for Vite React frontend
+# Enable CORS for React Frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,188 +35,255 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cross-platform temp audio upload directory
-UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "citizen_audio_uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@app.on_event("startup")
+def startup_event():
+    """Sync in-memory FAISS semantic index with existing DB records on boot."""
+    db = SessionLocal()
+    try:
+        active_tickets = db.query(Complaint).all()
+        clear_and_rebuild_index(active_tickets)
+    finally:
+        db.close()
 
 
-# ---------------------------------------------------------------------------
-# 1. Citizen Call Ingestion (STT + Groq LLM + FAISS Deduplication)
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------
+# 1. AUTHENTICATION (STAFF & ADMIN ONLY)
+# -------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/auth/login")
+def staff_login(payload: LoginRequest, db: Session = Depends(get_db)):
+    u = payload.username.strip().lower()
+    p = payload.password.strip()
+
+    # 1. Super Admin Account
+    if u == "admin" and p == "admin123":
+        return {
+            "status": "SUCCESS",
+            "role": "admin",
+            "name": "City Administrator",
+            "department": "All"
+        }
+
+    # 2. Hardcoded Fallback Dictionary for Robust Officer Demo Login
+    OFFICER_CREDS = {
+        "water_admin": ("Water Supply", "water123"),
+        "road_admin": ("Road Maintenance", "road123"),
+        "gas_admin": ("Gas & Energy", "gas123"),
+        "sanitation_admin": ("Sanitation", "sanitation123"),
+        "electric_admin": ("Electricity Board", "electric123"),
+        "police_admin": ("Public Safety", "police123"),
+    }
+
+    if u in OFFICER_CREDS and p == OFFICER_CREDS[u][1]:
+        dept_name = OFFICER_CREDS[u][0]
+        return {
+            "status": "SUCCESS",
+            "role": "officer",
+            "name": f"Officer ({dept_name})",
+            "department": dept_name
+        }
+
+    # 3. Database Dynamic Officer Check
+    dept = db.query(Department).filter(
+        (func.lower(Department.username) == u) &
+        (Department.password_hash == p)
+    ).first()
+
+    if dept:
+        return {
+            "status": "SUCCESS",
+            "role": "officer",
+            "name": f"Officer ({dept.name})",
+            "department": dept.name
+        }
+
+    raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+
+# -------------------------------------------------------------
+# 2. CITIZEN VOICE INGESTION & PUBLIC TRACKING (NO LOGIN)
+# -------------------------------------------------------------
+
 @app.post("/api/complaints/call-ingest")
-async def ingest_citizen_call(
-    audio: Optional[UploadFile] = File(None),
-    raw_text: Optional[str] = Form(None),
+async def ingest_voice_call(
+    audio: UploadFile = File(...),
     caller_phone: str = Form(...),
-    lat: float = Form(...),
-    lng: float = Form(...),
+    lat: float = Form(13.0827),
+    lng: float = Form(80.2707),
     db: Session = Depends(get_db)
 ):
-    if not audio and not raw_text:
-        raise HTTPException(status_code=400, detail="Provide either an audio recording or raw text.")
+    # Save audio temporarily for Whisper inference
+    suffix = os.path.splitext(audio.filename)[1] or ".webm"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await audio.read())
+        tmp_path = tmp.name
 
-    # A. Speech-to-Text translation via faster-whisper
-    if audio:
-        file_ext = audio.filename.split(".")[-1] if "." in audio.filename else "webm"
-        temp_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.{file_ext}")
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(audio.file, buffer)
+    try:
+        # Step A: Multilingual STT Translation
+        stt_result = transcribe_and_translate_audio(tmp_path)
+        transcript = stt_result["translated_text"]
+
+        # Step B: LLM Parameter Extraction
+        intel = extract_complaint_intelligence(transcript)
+
+        # Step C: Match target Department
+        dept_name = intel["department_name"]
+        clean_dept_word = dept_name.split()[0].strip()
+        department = db.query(Department).filter(
+            (Department.name.ilike(f"%{clean_dept_word}%")) |
+            (Department.name.ilike(f"%{dept_name}%"))
+        ).first()
+
+        if not department:
+            department = db.query(Department).first()
+
+        # Step D: Spatial & Semantic Deduplication
+        active_dict = {c.id: c for c in db.query(Complaint).filter(Complaint.status != "RESOLVED").all()}
+        duplicate = find_duplicate_complaint(intel["summary"], lat, lng, active_dict)
+
+        if duplicate:
+            # Increment caller counter and add subscriber
+            duplicate.report_count += 1
+            subscriber = CallerSubscriber(complaint_id=duplicate.id, phone_number=caller_phone)
+            db.add(subscriber)
+            db.commit()
+            db.refresh(duplicate)
+
+            send_sms_notification(
+                db, caller_phone, duplicate.ticket_id,
+                f"Helpline: Linked to existing incident #{duplicate.ticket_id}. Total Callers: {duplicate.report_count}. Track: http://localhost:5173/track/{duplicate.ticket_id}"
+            )
+
+            return {
+                "status": "MERGED_DUPLICATE",
+                "message": f"Merged with incident #{duplicate.ticket_id}",
+                "complaint": {
+                    "id": duplicate.id,
+                    "ticket_id": duplicate.ticket_id,
+                    "category": duplicate.category,
+                    "summary": duplicate.summary,
+                    "urgency": duplicate.urgency,
+                    "report_count": duplicate.report_count,
+                    "status": duplicate.status
+                }
+            }
+
+        # Step E: Create New Master Complaint
+        dept_code = clean_dept_word[:3].upper() if clean_dept_word else "GEN"
+        ticket_code = f"{dept_code}-{str(uuid.uuid4().hex[:4]).upper()}"
         
-        try:
-            stt_res = transcribe_and_translate_audio(temp_path)
-            transcript = stt_res.get("translated_text", "").strip()
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-    else:
-        transcript = raw_text.strip()
-
-    if not transcript:
-        transcript = "Citizen reported municipal grievance via voice call."
-
-    # B. Extract structured parameters via Groq (Llama 3)
-    ai_data = extract_complaint_intelligence(transcript)
-
-    # C. Resolve Department from extracted department_name
-    dept_name = ai_data.get("department_name", "General Administration")
-    dept = db.query(Department).filter(Department.name.ilike(f"%{dept_name}%")).first()
-    if not dept:
-        dept = db.query(Department).first()
-    dept_id = dept.id if dept else 1
-
-    # D. Deduplication check (FAISS cosine similarity + Haversine distance <= 500m)
-    open_complaints = {c.id: c for c in db.query(Complaint).filter(Complaint.status != "RESOLVED").all()}
-    duplicate_match = find_duplicate_complaint(ai_data["summary"], lat, lng, open_complaints)
-
-    if duplicate_match:
-        duplicate_match.report_count += 1
-        
-        # Link new subscriber phone number
-        sub = CallerSubscriber(complaint_id=duplicate_match.id, caller_phone=caller_phone)
-        db.add(sub)
-        db.commit()
-        db.refresh(duplicate_match)
-
-        # Dispatch duplicate confirmation SMS
-        sms_msg = (
-            f"Your report regarding '{duplicate_match.category}' has been linked with active Ticket #{duplicate_match.ticket_id} "
-            f"(Reported by {duplicate_match.report_count} citizens). Track status: http://localhost:5173/track/{duplicate_match.ticket_id}"
+        new_complaint = Complaint(
+            ticket_id=ticket_code,
+            department_id=department.id if department else None,
+            category=intel["category"],
+            summary=intel["summary"],
+            raw_transcript=transcript,
+            urgency=intel["urgency"],
+            sentiment=intel["sentiment"],
+            sentiment_score=intel["sentiment_score"],
+            is_suspicious=intel["is_suspicious"],
+            suspicious_reason=intel["suspicious_reason"],
+            lat=lat,
+            lng=lng,
+            location_name=intel["location_extracted"],
+            status="REGISTERED",
+            report_count=1
         )
-        send_sms_notification(db, caller_phone, duplicate_match.ticket_id, sms_msg)
-        
+        db.add(new_complaint)
+        db.commit()
+        db.refresh(new_complaint)
+
+        # Index vector in FAISS
+        index_new_complaint(new_complaint.id, new_complaint.summary)
+
+        # Link primary caller
+        subscriber = CallerSubscriber(complaint_id=new_complaint.id, phone_number=caller_phone)
+        db.add(subscriber)
+        db.commit()
+
+        # Send initial confirmation notification
+        send_sms_notification(
+            db, caller_phone, new_complaint.ticket_id,
+            f"Helpline: Registered #{new_complaint.ticket_id} ({new_complaint.category}). Track: http://localhost:5173/track/{new_complaint.ticket_id}"
+        )
+
         return {
-            "status": "MERGED_DUPLICATE",
+            "status": "CREATED",
             "complaint": {
-                "id": duplicate_match.id,
-                "ticket_id": duplicate_match.ticket_id,
-                "category": duplicate_match.category,
-                "summary": duplicate_match.summary,
-                "status": duplicate_match.status,
-                "report_count": duplicate_match.report_count,
-                "urgency": duplicate_match.urgency
+                "id": new_complaint.id,
+                "ticket_id": new_complaint.ticket_id,
+                "category": new_complaint.category,
+                "summary": new_complaint.summary,
+                "urgency": new_complaint.urgency,
+                "report_count": new_complaint.report_count,
+                "status": new_complaint.status
             }
         }
-
-    # E. Create Master Incident Record
-    prefix = dept.name[:3].upper() if dept else "CIT"
-    ticket_id = f"{prefix}-{random.randint(1000, 9999)}"
-
-    new_complaint = Complaint(
-        ticket_id=ticket_id,
-        raw_transcript=transcript,
-        translated_transcript=transcript,
-        summary=ai_data.get("summary", transcript),
-        category=ai_data.get("category", "General Grievance"),
-        urgency=ai_data.get("urgency", "Medium"),
-        sentiment=ai_data.get("sentiment", "Neutral"),
-        sentiment_score=float(ai_data.get("sentiment_score", 50.0)),
-        is_suspicious=bool(ai_data.get("is_suspicious", False)),
-        suspicious_reason=ai_data.get("suspicious_reason"),
-        department_id=dept_id,
-        lat=lat,
-        lng=lng,
-        location_name=ai_data.get("location_extracted", "GPS Location"),
-        status="REGISTERED",
-        report_count=1,
-        created_at=datetime.utcnow()
-    )
-    db.add(new_complaint)
-    db.commit()
-    db.refresh(new_complaint)
-
-    # Link initial caller as subscriber
-    db.add(CallerSubscriber(complaint_id=new_complaint.id, caller_phone=caller_phone))
-    db.commit()
-
-    # Index embedding into FAISS for rolling deduplication
-    index_new_complaint(new_complaint.id, new_complaint.summary)
-
-    # Dispatch registration SMS
-    reg_sms = (
-        f"Citizen Helpline: Your complaint #{new_complaint.ticket_id} regarding '{new_complaint.category}' is registered. "
-        f"Assigned to {dept.name if dept else 'Department'}. Track: http://localhost:5173/track/{new_complaint.ticket_id}"
-    )
-    send_sms_notification(db, caller_phone, new_complaint.ticket_id, reg_sms)
-
-    return {
-        "status": "CREATED",
-        "complaint": {
-            "id": new_complaint.id,
-            "ticket_id": new_complaint.ticket_id,
-            "category": new_complaint.category,
-            "summary": new_complaint.summary,
-            "status": new_complaint.status,
-            "report_count": new_complaint.report_count,
-            "urgency": new_complaint.urgency
-        }
-    }
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
-# ---------------------------------------------------------------------------
-# 2. Public Citizen Status Tracking Route
-# ---------------------------------------------------------------------------
 @app.get("/api/complaints/{ticket_id}")
-def get_complaint_by_ticket(ticket_id: str, db: Session = Depends(get_db)):
-    complaint = db.query(Complaint).filter(Complaint.ticket_id == ticket_id).first()
-    if not complaint:
-        raise HTTPException(status_code=404, detail="Ticket not found")
+def get_complaint_status(ticket_id: str, db: Session = Depends(get_db)):
+    comp = db.query(Complaint).filter(Complaint.ticket_id == ticket_id).first()
+    if not comp:
+        raise HTTPException(status_code=404, detail="Grievance record not found.")
 
+    dept_name = comp.department_rel.name if comp.department_rel else comp.category
     return {
-        "id": complaint.id,
-        "ticket_id": complaint.ticket_id,
-        "category": complaint.category,
-        "summary": complaint.summary,
-        "urgency": complaint.urgency,
-        "sentiment": complaint.sentiment,
-        "status": complaint.status,
-        "report_count": complaint.report_count,
-        "lat": complaint.lat,
-        "lng": complaint.lng,
-        "location_name": complaint.location_name,
-        "created_at": complaint.created_at.isoformat() if complaint.created_at else None,
-        "acknowledged_at": complaint.acknowledged_at.isoformat() if complaint.acknowledged_at else None,
-        "deadline_set": complaint.deadline_set.isoformat() if complaint.deadline_set else None,
-        "resolved_at": complaint.resolved_at.isoformat() if complaint.resolved_at else None,
-        "assigned_officer": complaint.assigned_officer,
-        "department": complaint.dept.name if complaint.dept else "Unassigned"
+        "id": comp.id,
+        "ticket_id": comp.ticket_id,
+        "category": comp.category,
+        "summary": comp.summary,
+        "urgency": comp.urgency,
+        "status": comp.status,
+        "lat": comp.lat,
+        "lng": comp.lng,
+        "location_name": comp.location_name,
+        "department": dept_name,
+        "report_count": comp.report_count,
+        "assigned_officer": comp.assigned_officer,
+        "created_at": comp.created_at.isoformat() if comp.created_at else None,
+        "acknowledged_at": comp.acknowledged_at.isoformat() if comp.acknowledged_at else None,
+        "deadline_set": comp.deadline_set.isoformat() if comp.deadline_set else None,
+        "resolved_at": comp.resolved_at.isoformat() if comp.resolved_at else None,
     }
 
 
-# ---------------------------------------------------------------------------
-# 3. Officer Portal Workflow Routes (Scoped Queue, Acknowledge & Resolve)
-# ---------------------------------------------------------------------------
-@app.get("/api/officer/tickets")
-def get_officer_department_tickets(dept: str = Query("Water Supply"), db: Session = Depends(get_db)):
-    department = db.query(Department).filter(Department.name.ilike(f"%{dept}%")).first()
-    if not department:
-        return []
+# -------------------------------------------------------------
+# 3. OFFICER WORKSPACE & TRIAGE
+# -------------------------------------------------------------
 
-    complaints = (
-        db.query(Complaint)
-        .filter(Complaint.department_id == department.id)
-        .order_by(Complaint.created_at.desc())
-        .all()
-    )
+@app.get("/api/officer/tickets")
+def get_officer_tickets(dept: str = Query("Water Supply"), db: Session = Depends(get_db)):
+    query = db.query(Complaint)
+    if dept != "All":
+        clean_keyword = dept.split(" ")[0].strip()
+        department = db.query(Department).filter(
+            (Department.name.ilike(f"%{clean_keyword}%")) |
+            (Department.name.ilike(f"%{dept}%"))
+        ).first()
+
+        if department:
+            query = query.filter(
+                (Complaint.department_id == department.id) |
+                (Complaint.category.ilike(f"%{clean_keyword}%"))
+            )
+        else:
+            query = query.filter(Complaint.category.ilike(f"%{clean_keyword}%"))
+
+    complaints = query.order_by(Complaint.created_at.desc()).all()
+    
+    # Fallback to all complaints if specific filter is empty and All is requested
+    if not complaints and dept == "All":
+        complaints = db.query(Complaint).order_by(Complaint.created_at.desc()).all()
 
     return [
         {
@@ -229,168 +298,139 @@ def get_officer_department_tickets(dept: str = Query("Water Supply"), db: Sessio
             "lng": c.lng,
             "location_name": c.location_name,
             "created_at": c.created_at.isoformat() if c.created_at else None,
+            "acknowledged_at": c.acknowledged_at.isoformat() if c.acknowledged_at else None,
             "deadline_set": c.deadline_set.isoformat() if c.deadline_set else None,
+            "resolved_at": c.resolved_at.isoformat() if c.resolved_at else None,
             "assigned_officer": c.assigned_officer
         }
         for c in complaints
     ]
 
+
 @app.post("/api/officer/acknowledge/{ticket_id}")
-def acknowledge_ticket(
+def acknowledge_complaint(
     ticket_id: str,
     officer_name: str = Form(...),
-    deadline_hours: int = Form(...),
+    deadline_hours: int = Form(4),
     db: Session = Depends(get_db)
 ):
-    complaint = db.query(Complaint).filter(Complaint.ticket_id == ticket_id).first()
-    if not complaint:
+    comp = db.query(Complaint).filter(Complaint.ticket_id == ticket_id).first()
+    if not comp:
         raise HTTPException(status_code=404, detail="Complaint not found")
 
-    complaint.status = "ACKNOWLEDGED"
-    complaint.assigned_officer = officer_name
-    complaint.acknowledged_at = datetime.utcnow()
-    complaint.deadline_set = datetime.utcnow() + timedelta(hours=deadline_hours)
+    comp.status = "ACKNOWLEDGED"
+    comp.assigned_officer = officer_name
+    comp.acknowledged_at = datetime.utcnow()
+    comp.deadline_set = datetime.utcnow() + timedelta(hours=deadline_hours)
     db.commit()
 
-    formatted_deadline = complaint.deadline_set.strftime("%b %d at %I:%M %p")
-    for sub in complaint.subscribers:
-        dept_name = complaint.dept.name if complaint.dept else "Department"
-        ack_sms = (
-            f"Update on #{complaint.ticket_id}: Officer {officer_name} ({dept_name}) has acknowledged your issue. "
-            f"Target completion deadline: {formatted_deadline}."
+    # Notify all linked citizens
+    for sub in comp.subscribers:
+        send_sms_notification(
+            db, sub.phone_number, comp.ticket_id,
+            f"Update: #{comp.ticket_id} acknowledged by Officer {officer_name}. Promised SLA: {deadline_hours} hrs. Track: http://localhost:5173/track/{comp.ticket_id}"
         )
-        send_sms_notification(db, sub.caller_phone, complaint.ticket_id, ack_sms)
 
-    return {"status": "ACKNOWLEDGED", "ticket_id": complaint.ticket_id, "deadline_set": complaint.deadline_set}
+    return {"status": "SUCCESS", "message": "Ticket acknowledged."}
+
 
 @app.post("/api/officer/resolve/{ticket_id}")
-def resolve_ticket(ticket_id: str, db: Session = Depends(get_db)):
-    complaint = db.query(Complaint).filter(Complaint.ticket_id == ticket_id).first()
-    if not complaint:
+def resolve_complaint(ticket_id: str, db: Session = Depends(get_db)):
+    comp = db.query(Complaint).filter(Complaint.ticket_id == ticket_id).first()
+    if not comp:
         raise HTTPException(status_code=404, detail="Complaint not found")
 
-    complaint.status = "RESOLVED"
-    complaint.resolved_at = datetime.utcnow()
+    comp.status = "RESOLVED"
+    comp.resolved_at = datetime.utcnow()
     db.commit()
 
-    for sub in complaint.subscribers:
-        res_sms = (
-            f"Issue Resolved: Complaint #{complaint.ticket_id} ({complaint.category}) has been marked RESOLVED. "
-            f"Thank you for reporting."
+    # Notify all linked citizens
+    for sub in comp.subscribers:
+        send_sms_notification(
+            db, sub.phone_number, comp.ticket_id,
+            f"Resolved: Incident #{comp.ticket_id} marked resolved by department field unit. Thank you!"
         )
-        send_sms_notification(db, sub.caller_phone, complaint.ticket_id, res_sms)
 
-    return {"status": "RESOLVED", "ticket_id": complaint.ticket_id}
+    return {"status": "SUCCESS", "message": "Ticket resolved."}
 
 
-# ---------------------------------------------------------------------------
-# 4. Admin Command Center & Live Feed Routes
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------
+# 4. SUPER ADMIN COMMAND CENTER & AUDIT PDF GENERATOR
+# -------------------------------------------------------------
+
 @app.get("/api/dashboard/overview")
 def get_dashboard_overview(db: Session = Depends(get_db)):
     total = db.query(Complaint).count()
+    active = db.query(Complaint).filter(Complaint.status != "RESOLVED").count()
     resolved = db.query(Complaint).filter(Complaint.status == "RESOLVED").count()
-    emergency = db.query(Complaint).filter(Complaint.urgency == "Emergency").count()
-    active = total - resolved
+    emergency = db.query(Complaint).filter(Complaint.urgency.in_(["Emergency", "High"])).count()
+    return {"total": total, "active": active, "resolved": resolved, "emergency": emergency}
 
-    return {
-        "total": total,
-        "active": active,
-        "resolved": resolved,
-        "emergency": emergency
-    }
 
 @app.get("/api/dashboard/live-feed")
 def get_live_feed(db: Session = Depends(get_db)):
-    complaints = db.query(Complaint).order_by(Complaint.created_at.desc()).limit(50).all()
+    items = db.query(Complaint).order_by(Complaint.created_at.desc()).limit(50).all()
     return [
         {
             "id": c.id,
             "ticket_id": c.ticket_id,
-            "category": c.category,
             "summary": c.summary,
+            "category": c.category,
             "urgency": c.urgency,
-            "sentiment": c.sentiment,
-            "report_count": c.report_count,
             "status": c.status,
+            "report_count": c.report_count,
             "lat": c.lat,
             "lng": c.lng,
-            "is_suspicious": c.is_suspicious,
             "created_at": c.created_at.isoformat() if c.created_at else None
         }
-        for c in complaints
+        for c in items
     ]
 
 
-# ---------------------------------------------------------------------------
-# 5. On-the-Fly PDF Audit Report Generation
-# ---------------------------------------------------------------------------
 class ReportRequest(BaseModel):
-    format: str = "PDF"
+    format: Optional[str] = "PDF"
+
 
 @app.post("/api/reports/generate")
 def generate_audit_report(payload: ReportRequest, db: Session = Depends(get_db)):
-    try:
-        from reportlab.lib.pagesizes import letter
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.lib import colors
+    complaints = db.query(Complaint).order_by(Complaint.created_at.desc()).all()
+    
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=letter)
+    
+    # PDF Header
+    pdf.setFont("Helvetica-Bold", 16)
+    pdf.drawString(50, 750, "Municipal Incident Audit Report")
+    
+    pdf.setFont("Helvetica", 10)
+    pdf.drawString(50, 735, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} | Total Grievances: {len(complaints)}")
+    pdf.line(50, 725, 550, 725)
 
-        report_filename = f"Municipal_Incident_Audit_{uuid.uuid4().hex[:8]}.pdf"
-        report_path = os.path.join(tempfile.gettempdir(), report_filename)
+    y = 700
+    pdf.setFont("Helvetica-Bold", 9)
+    pdf.drawString(50, y, "Ticket ID")
+    pdf.drawString(130, y, "Category")
+    pdf.drawString(270, y, "Priority")
+    pdf.drawString(340, y, "Status")
+    pdf.drawString(420, y, "Callers")
+    y -= 15
 
-        doc = SimpleDocTemplate(report_path, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
-        elements = []
-        styles = getSampleStyleSheet()
+    pdf.setFont("Helvetica", 8)
+    for c in complaints:
+        if y < 60:
+            pdf.showPage()
+            y = 750
+        pdf.drawString(50, y, f"#{c.ticket_id}")
+        pdf.drawString(130, y, str(c.category)[:22])
+        pdf.drawString(270, y, str(c.urgency))
+        pdf.drawString(340, y, str(c.status))
+        pdf.drawString(420, y, str(c.report_count))
+        y -= 16
 
-        title_style = ParagraphStyle(
-            name="TitleStyle",
-            parent=styles["Heading1"],
-            fontSize=18,
-            leading=22,
-            textColor=colors.HexColor("#0f172a"),
-            alignment=1
-        )
-
-        elements.append(Paragraph("MUNICIPAL INCIDENT & GRIEVANCE AUDIT REPORT", title_style))
-        elements.append(Spacer(1, 10))
-
-        sub_text = f"Generated on: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} | Automated AI Triage Platform"
-        elements.append(Paragraph(sub_text, styles["Normal"]))
-        elements.append(Spacer(1, 15))
-
-        complaints = db.query(Complaint).order_by(Complaint.created_at.desc()).limit(25).all()
-
-        table_data = [["Ticket", "Category", "Summary", "Urgency", "Callers", "Status"]]
-        for c in complaints:
-            table_data.append([
-                c.ticket_id,
-                c.category[:18],
-                Paragraph(c.summary[:80] + "..." if len(c.summary) > 80 else c.summary, styles["Normal"]),
-                c.urgency,
-                str(c.report_count),
-                c.status
-            ])
-
-        col_widths = [65, 85, 210, 60, 45, 75]
-        t = Table(table_data, colWidths=col_widths, repeatRows=1)
-        t.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1e293b")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-        ]))
-        elements.append(t)
-
-        doc.build(elements)
-        return FileResponse(
-            report_path,
-            media_type="application/pdf",
-            filename=f"Municipal_Incident_Audit_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF Generation failed: {str(e)}")
+    pdf.save()
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer, 
+        media_type="application/pdf", 
+        headers={"Content-Disposition": "attachment; filename=Municipal_Incident_Report.pdf"}
+    )

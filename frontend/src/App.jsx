@@ -2,26 +2,44 @@ import React from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import CitizenCallPage from './pages/CitizenCallPage';
 import CitizenTrackPage from './pages/CitizenTrackPage';
-import OfficerLoginPage from './pages/OfficerLoginPage';
 import OfficerPortalPage from './pages/OfficerPortalPage';
 import AdminDashboard from './pages/AdminDashboard';
+import LoginPage from './pages/LoginPage';
+import { ProtectedOfficerRoute, ProtectedAdminRoute } from './components/ProtectedRoute';
 
 export default function App() {
   return (
     <BrowserRouter>
       <Routes>
-        {/* 1. Citizen Portal */}
+        {/* Public Citizen Routes (NO LOGIN REQUIRED) */}
         <Route path="/" element={<CitizenCallPage />} />
         <Route path="/track/:ticketId" element={<CitizenTrackPage />} />
 
-        {/* 2. Department Officer Workspace */}
-        <Route path="/officer/login" element={<OfficerLoginPage />} />
-        <Route path="/officer/portal" element={<OfficerPortalPage />} />
+        {/* Authentication Route */}
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="/officer/login" element={<Navigate to="/login" replace />} />
 
-        {/* 3. Municipal Command Center */}
-        <Route path="/admin" element={<AdminDashboard />} />
+        {/* Protected Officer Route */}
+        <Route 
+          path="/officer/portal" 
+          element={
+            <ProtectedOfficerRoute>
+              <OfficerPortalPage />
+            </ProtectedOfficerRoute>
+          } 
+        />
 
-        {/* Fallback */}
+        {/* Protected Admin Route */}
+        <Route 
+          path="/admin" 
+          element={
+            <ProtectedAdminRoute>
+              <AdminDashboard />
+            </ProtectedAdminRoute>
+          } 
+        />
+
+        {/* Catch-all */}
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>
