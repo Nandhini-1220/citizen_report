@@ -45,7 +45,7 @@ class CallerSubscriber(Base):
     __tablename__ = "caller_subscribers"
     id = Column(Integer, primary_key=True, index=True)
     complaint_id = Column(Integer, ForeignKey("complaints.id"))
-    caller_phone = Column(String, nullable=False)
+    phone_number = Column(String, index=True)
     registered_at = Column(DateTime, default=datetime.utcnow)
 
     complaint = relationship("Complaint", back_populates="subscribers")

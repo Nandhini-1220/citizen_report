@@ -2,10 +2,11 @@ import os
 import io
 import tempfile
 import uuid
+import requests
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -21,7 +22,7 @@ from app.services.llm_service import extract_complaint_intelligence
 from app.services.dedupe_service import find_duplicate_complaint, index_new_complaint, clear_and_rebuild_index
 from app.services.sms_service import send_sms_notification
 
-# Initialize database schema
+# Initialize database schema tables
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Municipal Voice AI Grievance Platform")
@@ -70,7 +71,7 @@ def staff_login(payload: LoginRequest, db: Session = Depends(get_db)):
             "department": "All"
         }
 
-    # 2. Hardcoded Fallback Dictionary for Robust Officer Demo Login
+    # 2. Hardcoded Fallback Dictionary for Robust Officer Login
     OFFICER_CREDS = {
         "water_admin": ("Water Supply", "water123"),
         "road_admin": ("Road Maintenance", "road123"),
@@ -118,7 +119,6 @@ async def ingest_voice_call(
     lng: float = Form(80.2707),
     db: Session = Depends(get_db)
 ):
-    # Save audio temporarily for Whisper inference
     suffix = os.path.splitext(audio.filename)[1] or ".webm"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(await audio.read())
@@ -127,14 +127,15 @@ async def ingest_voice_call(
     try:
         # Step A: Multilingual STT Translation
         stt_result = transcribe_and_translate_audio(tmp_path)
-        transcript = stt_result["translated_text"]
+        transcript = stt_result.get("translated_text", "")
 
         # Step B: LLM Parameter Extraction
         intel = extract_complaint_intelligence(transcript)
 
-        # Step C: Match target Department
-        dept_name = intel["department_name"]
-        clean_dept_word = dept_name.split()[0].strip()
+        # Step C: Safe Department Matching
+        dept_name = intel.get("department_name") or "General"
+        clean_dept_word = dept_name.split()[0].strip() if dept_name else "GEN"
+        
         department = db.query(Department).filter(
             (Department.name.ilike(f"%{clean_dept_word}%")) |
             (Department.name.ilike(f"%{dept_name}%"))
@@ -144,11 +145,14 @@ async def ingest_voice_call(
             department = db.query(Department).first()
 
         # Step D: Spatial & Semantic Deduplication
+        summary_text = intel.get("summary") or transcript or "Citizen reported grievance"
+        category_text = intel.get("category") or "General Issue"
+        urgency_text = intel.get("urgency") or "Medium"
+
         active_dict = {c.id: c for c in db.query(Complaint).filter(Complaint.status != "RESOLVED").all()}
-        duplicate = find_duplicate_complaint(intel["summary"], lat, lng, active_dict)
+        duplicate = find_duplicate_complaint(summary_text, lat, lng, active_dict)
 
         if duplicate:
-            # Increment caller counter and add subscriber
             duplicate.report_count += 1
             subscriber = CallerSubscriber(complaint_id=duplicate.id, phone_number=caller_phone)
             db.add(subscriber)
@@ -181,17 +185,17 @@ async def ingest_voice_call(
         new_complaint = Complaint(
             ticket_id=ticket_code,
             department_id=department.id if department else None,
-            category=intel["category"],
-            summary=intel["summary"],
+            category=category_text,
+            summary=summary_text,
             raw_transcript=transcript,
-            urgency=intel["urgency"],
-            sentiment=intel["sentiment"],
-            sentiment_score=intel["sentiment_score"],
-            is_suspicious=intel["is_suspicious"],
-            suspicious_reason=intel["suspicious_reason"],
+            urgency=urgency_text,
+            sentiment=intel.get("sentiment", "Neutral"),
+            sentiment_score=intel.get("sentiment_score", 0.0),
+            is_suspicious=intel.get("is_suspicious", False),
+            suspicious_reason=intel.get("suspicious_reason"),
             lat=lat,
             lng=lng,
-            location_name=intel["location_extracted"],
+            location_name=intel.get("location_extracted"),
             status="REGISTERED",
             report_count=1
         )
@@ -236,7 +240,13 @@ def get_complaint_status(ticket_id: str, db: Session = Depends(get_db)):
     if not comp:
         raise HTTPException(status_code=404, detail="Grievance record not found.")
 
-    dept_name = comp.department_rel.name if comp.department_rel else comp.category
+    # Safe department resolution without relying on relationship names
+    dept = None
+    if comp.department_id:
+        dept = db.query(Department).filter(Department.id == comp.department_id).first()
+
+    dept_name = dept.name if dept else (comp.category or "General")
+
     return {
         "id": comp.id,
         "ticket_id": comp.ticket_id,
@@ -254,6 +264,8 @@ def get_complaint_status(ticket_id: str, db: Session = Depends(get_db)):
         "acknowledged_at": comp.acknowledged_at.isoformat() if comp.acknowledged_at else None,
         "deadline_set": comp.deadline_set.isoformat() if comp.deadline_set else None,
         "resolved_at": comp.resolved_at.isoformat() if comp.resolved_at else None,
+        "rating": getattr(comp, "rating", None),
+        "feedback_notes": getattr(comp, "feedback_notes", None)
     }
 
 
@@ -281,7 +293,6 @@ def get_officer_tickets(dept: str = Query("Water Supply"), db: Session = Depends
 
     complaints = query.order_by(Complaint.created_at.desc()).all()
     
-    # Fallback to all complaints if specific filter is empty and All is requested
     if not complaints and dept == "All":
         complaints = db.query(Complaint).order_by(Complaint.created_at.desc()).all()
 
@@ -301,7 +312,8 @@ def get_officer_tickets(dept: str = Query("Water Supply"), db: Session = Depends
             "acknowledged_at": c.acknowledged_at.isoformat() if c.acknowledged_at else None,
             "deadline_set": c.deadline_set.isoformat() if c.deadline_set else None,
             "resolved_at": c.resolved_at.isoformat() if c.resolved_at else None,
-            "assigned_officer": c.assigned_officer
+            "assigned_officer": c.assigned_officer,
+            "rating": getattr(c, "rating", None)
         }
         for c in complaints
     ]
@@ -326,10 +338,12 @@ def acknowledge_complaint(
 
     # Notify all linked citizens
     for sub in comp.subscribers:
-        send_sms_notification(
-            db, sub.phone_number, comp.ticket_id,
-            f"Update: #{comp.ticket_id} acknowledged by Officer {officer_name}. Promised SLA: {deadline_hours} hrs. Track: http://localhost:5173/track/{comp.ticket_id}"
-        )
+        phone = getattr(sub, "phone_number", None) or getattr(sub, "phone", "")
+        if phone:
+            send_sms_notification(
+                db, phone, comp.ticket_id,
+                f"Update: #{comp.ticket_id} acknowledged by Officer {officer_name}. Promised SLA: {deadline_hours} hrs. Track: http://localhost:5173/track/{comp.ticket_id}"
+            )
 
     return {"status": "SUCCESS", "message": "Ticket acknowledged."}
 
@@ -344,12 +358,14 @@ def resolve_complaint(ticket_id: str, db: Session = Depends(get_db)):
     comp.resolved_at = datetime.utcnow()
     db.commit()
 
-    # Notify all linked citizens
+    # Notify all linked citizens and prompt for feedback
     for sub in comp.subscribers:
-        send_sms_notification(
-            db, sub.phone_number, comp.ticket_id,
-            f"Resolved: Incident #{comp.ticket_id} marked resolved by department field unit. Thank you!"
-        )
+        phone = getattr(sub, "phone_number", None) or getattr(sub, "phone", "")
+        if phone:
+            send_sms_notification(
+                db, phone, comp.ticket_id,
+                f"Resolved: Incident #{comp.ticket_id} resolved! Please rate our service: http://localhost:5173/feedback/{comp.ticket_id}"
+            )
 
     return {"status": "SUCCESS", "message": "Ticket resolved."}
 
@@ -398,7 +414,6 @@ def generate_audit_report(payload: ReportRequest, db: Session = Depends(get_db))
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=letter)
     
-    # PDF Header
     pdf.setFont("Helvetica-Bold", 16)
     pdf.drawString(50, 750, "Municipal Incident Audit Report")
     
@@ -434,3 +449,129 @@ def generate_audit_report(payload: ReportRequest, db: Session = Depends(get_db))
         media_type="application/pdf", 
         headers={"Content-Disposition": "attachment; filename=Municipal_Incident_Report.pdf"}
     )
+
+
+# -------------------------------------------------------------
+# 5. CITIZEN 5-STAR FEEDBACK
+# -------------------------------------------------------------
+
+class FeedbackSubmission(BaseModel):
+    rating: int
+    notes: Optional[str] = ""
+
+
+@app.post("/api/complaints/{ticket_id}/feedback")
+def submit_citizen_feedback(ticket_id: str, payload: FeedbackSubmission, db: Session = Depends(get_db)):
+    comp = db.query(Complaint).filter(Complaint.ticket_id == ticket_id).first()
+    if not comp:
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+
+    if comp.status != "RESOLVED":
+        raise HTTPException(status_code=400, detail="Feedback can only be submitted for resolved tickets.")
+
+    if hasattr(comp, "rating"):
+        comp.rating = payload.rating
+        comp.feedback_notes = payload.notes
+        comp.feedback_submitted_at = datetime.utcnow()
+        db.commit()
+
+    return {"status": "SUCCESS", "message": "Feedback submitted successfully."}
+
+
+# -------------------------------------------------------------
+# 6. AUTOMATED TOLL-FREE TELEPHONY WEBHOOKS (TWILIO / EXOTEL)
+# -------------------------------------------------------------
+
+@app.post("/api/telephony/incoming-call")
+async def handle_incoming_call():
+    """Plays greeting and records citizen's voice grievance."""
+    twiml_response = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say language="en-IN">Welcome to the Automated Municipal Grievance Helpline. Please state your issue and location after the beep. Press hash when finished.</Say>
+    <Record 
+        action="/api/telephony/voice-webhook" 
+        method="POST" 
+        maxLength="60" 
+        finishOnKey="#" 
+        playBeep="true"
+    />
+    <Say language="en-IN">Thank you. Goodbye.</Say>
+</Response>"""
+    return Response(content=twiml_response, media_type="application/xml")
+
+
+@app.post("/api/telephony/voice-webhook")
+async def process_telephony_recording(
+    RecordingUrl: str = Form(...),
+    From: str = Form(...),
+    db: Session = Depends(get_db)
+):
+    """Processes telephony recording URL after call completes."""
+    audio_content = requests.get(f"{RecordingUrl}.mp3").content
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+        tmp.write(audio_content)
+        tmp_path = tmp.name
+
+    try:
+        stt_result = transcribe_and_translate_audio(tmp_path)
+        transcript = stt_result.get("translated_text", "")
+        intel = extract_complaint_intelligence(transcript)
+
+        dept_name = intel.get("department_name") or "General"
+        clean_dept = dept_name.split()[0].strip() if dept_name else "GEN"
+        dept = db.query(Department).filter(Department.name.ilike(f"%{clean_dept}%")).first() or db.query(Department).first()
+
+        lat, lng = 13.0827, 80.2707
+        summary_text = intel.get("summary") or transcript or "Toll-free voice report"
+
+        active_dict = {c.id: c for c in db.query(Complaint).filter(Complaint.status != "RESOLVED").all()}
+        duplicate = find_duplicate_complaint(summary_text, lat, lng, active_dict)
+
+        if duplicate:
+            duplicate.report_count += 1
+            db.add(CallerSubscriber(complaint_id=duplicate.id, phone_number=From))
+            db.commit()
+            ticket_id = duplicate.ticket_id
+
+            send_sms_notification(
+                db, From, ticket_id,
+                f"Helpline: Linked to existing issue #{ticket_id}. Track: http://localhost:5173/track/{ticket_id}"
+            )
+        else:
+            ticket_id = f"{clean_dept[:3].upper()}-{str(uuid.uuid4().hex[:4]).upper()}"
+            new_comp = Complaint(
+                ticket_id=ticket_id,
+                department_id=dept.id if dept else None,
+                category=intel.get("category", "General Issue"),
+                summary=summary_text,
+                raw_transcript=transcript,
+                urgency=intel.get("urgency", "Medium"),
+                sentiment=intel.get("sentiment", "Neutral"),
+                sentiment_score=intel.get("sentiment_score", 0.0),
+                lat=lat,
+                lng=lng,
+                location_name=intel.get("location_extracted"),
+                status="REGISTERED",
+                report_count=1
+            )
+            db.add(new_comp)
+            db.commit()
+            db.refresh(new_comp)
+
+            index_new_complaint(new_comp.id, new_comp.summary)
+            db.add(CallerSubscriber(complaint_id=new_comp.id, phone_number=From))
+            db.commit()
+
+            send_sms_notification(
+                db, From, ticket_id,
+                f"Helpline: Registered #{ticket_id} ({new_comp.category}). Track: http://localhost:5173/track/{ticket_id}"
+            )
+
+        resp = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say language="en-IN">Thank you. Your complaint is registered under ticket number {ticket_id}. We have sent tracking details to your mobile number. Goodbye.</Say>
+</Response>"""
+        return Response(content=resp, media_type="application/xml")
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
