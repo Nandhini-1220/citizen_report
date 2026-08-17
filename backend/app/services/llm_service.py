@@ -1,99 +1,108 @@
 import os
 import json
-import re
-from dotenv import load_dotenv
 from groq import Groq
+from dotenv import load_dotenv
 
-# Load environment variables
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+load_dotenv()
 
-_client = None
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-def get_groq_client():
-    global _client
-    if _client is None:
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            raise ValueError("GROQ_API_KEY is not set in backend/.env file.")
-        _client = Groq(api_key=api_key)
-    return _client
+VALID_DEPARTMENTS = [
+    "Water Supply",
+    "Road Maintenance",
+    "Gas & Energy",
+    "Sanitation",
+    "Electricity Board",
+    "Public Safety"
+]
 
-EXTRACTION_SYSTEM_PROMPT = """You are the core cognitive intelligence engine of a municipal 311 / emergency grievance dispatch system.
-Your job is to analyze citizen transcripts and output strictly valid JSON conforming exactly to the requested schema.
-
-Output Schema Rules:
-1. "summary": Exactly 1-2 factual sentences summarizing the problem clearly without conversational fluff.
-2. "category": Must be one of ["Pothole / Road Maintenance", "Water Leakage / Supply", "Gas Hazard / Pipeline", "Sewage / Waste Management", "Electricity / Power Outage", "Public Safety / Police", "General Grievance"].
-3. "department_name": Must be one of ["Road Maintenance", "Water Supply", "Gas & Energy", "Sanitation", "Electricity Board", "Public Safety", "General Administration"].
-4. "urgency": Must be one of ["Low", "Medium", "High", "Emergency"]. Gas leaks, open live wires, flooding, or collapsing structures must be "Emergency" or "High".
-5. "sentiment": One of ["Positive", "Neutral", "Negative"].
-6. "sentiment_score": Float between 0.0 (extreme distress/anger) to 100.0 (calm/happy). Default 50.0.
-7. "is_suspicious": Boolean (true if prank, alien sighting, nonsensical joke, or abusive spam; otherwise false).
-8. "suspicious_reason": Short reason if suspicious, else null.
-9. "location_extracted": Exact landmark, street, sector, or ward mentioned in text, or null if none."""
-
-USER_PROMPT_TEMPLATE = """Citizen Spoken Transcript:
-\"\"\"{transcript}\"\"\"
-
-Analyze the transcript and return ONLY raw JSON matching the required schema."""
-
-def clean_json_string(raw_str: str) -> str:
-    """Removes markdown code fences if present."""
-    raw_str = raw_str.strip()
-    if raw_str.startswith("```json"):
-        raw_str = raw_str[7:]
-    elif raw_str.startswith("```"):
-        raw_str = raw_str[3:]
-    if raw_str.endswith("```"):
-        raw_str = raw_str[:-3]
-    return raw_str.strip()
+CIVIC_CATEGORIES = [
+    "Pothole / Road Damage",
+    "Water Leakage / Contamination",
+    "Garbage / Sewage Overflow",
+    "Streetlight / Power Outage",
+    "Gas Leakage / Pipeline Fault",
+    "Traffic Hazard / Public Safety"
+]
 
 def extract_complaint_intelligence(transcript: str) -> dict:
     """
-    Extracts structured parameters from an English transcript in a single fast Groq API pass.
+    Evaluates citizen audio transcript.
+    Strictly filters out non-civic issues, random chatter, greetings, or tech issues.
     """
-    client = get_groq_client()
+    if not transcript or len(transcript.strip()) < 8:
+        return {
+            "is_civic_complaint": False,
+            "rejection_reason": "Audio transcript is too short or silent.",
+            "category": "Invalid",
+            "department_name": "None",
+            "summary": "",
+            "urgency": "Low",
+            "location_extracted": "",
+            "sentiment": "Neutral",
+            "sentiment_score": 0.0,
+            "is_suspicious": True,
+            "suspicious_reason": "Inaudible or insufficient voice input."
+        }
+
+    system_prompt = f"""
+You are an expert AI Municipal Grievance Triage Officer.
+Your job is to analyze transcripts from citizen voice calls and determine if they describe a REAL civic/municipal issue.
+
+MUNICIPAL DOMAINS ONLY:
+- Roads, potholes, pavements
+- Drainage, sewage, garbage disposal, sanitation
+- Streetlights, power cuts, exposed electrical wires
+- Drinking water supply, pipeline leaks, water contamination
+- Public safety, fallen trees, traffic obstruction
+
+NON-CIVIC / INVALID TOPICS:
+- Personal computer, laptop, software, or phone errors
+- Casual greetings, apologies ("I'm sorry", "hello", "thank you")
+- Private domestic disputes, business inquiries, unrelated noise
+
+Return ONLY a raw JSON object with these exact keys:
+{{
+  "is_civic_complaint": true | false,
+  "rejection_reason": "Explanation if not a valid civic complaint, else null",
+  "category": "One of {CIVIC_CATEGORIES} or 'General Issue'",
+  "department_name": "One of {VALID_DEPARTMENTS}",
+  "summary": "Clear, concise 1-2 sentence description of the civic problem",
+  "location_extracted": "Street, area, or landmark mentioned, or null",
+  "urgency": "Low" | "Medium" | "High" | "Emergency",
+  "sentiment": "Angry" | "Frustrated" | "Neutral" | "Polite",
+  "sentiment_score": -1.0 to 1.0,
+  "is_suspicious": false,
+  "suspicious_reason": null
+}}
+"""
 
     try:
-        completion = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+        chat_completion = client.chat.completions.create(
             messages=[
-                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": USER_PROMPT_TEMPLATE.format(transcript=transcript)}
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Citizen Voice Transcript:\n\"\"\"{transcript}\"\"\""}
             ],
+            model="llama-3.1-8b-instant",
             temperature=0.1,
             response_format={"type": "json_object"}
         )
 
-        raw_content = completion.choices[0].message.content
-        cleaned_json = clean_json_string(raw_content)
-        parsed = json.loads(cleaned_json)
-
-        # Fallback defaults for missing keys
-        return {
-            "summary": parsed.get("summary", transcript),
-            "category": parsed.get("category", "General Grievance"),
-            "department_name": parsed.get("department_name", "General Administration"),
-            "urgency": parsed.get("urgency", "Medium"),
-            "sentiment": parsed.get("sentiment", "Neutral"),
-            "sentiment_score": float(parsed.get("sentiment_score", 50.0)),
-            "is_suspicious": bool(parsed.get("is_suspicious", False)),
-            "suspicious_reason": parsed.get("suspicious_reason", None),
-            "location_extracted": parsed.get("location_extracted", None)
-        }
+        content = chat_completion.choices[0].message.content
+        return json.loads(content)
 
     except Exception as e:
-        print(f"[LLM ERROR] Groq extraction encountered an error: {e}")
-        # Graceful fallback so caller pipeline never breaks
+        print(f"[LLM Error] Fallback extraction triggered: {e}")
         return {
-            "summary": transcript[:150] if transcript else "Citizen grievance received.",
-            "category": "General Grievance",
-            "department_name": "General Administration",
+            "is_civic_complaint": False,
+            "rejection_reason": "Failed to extract valid municipal grievance.",
+            "category": "General Issue",
+            "department_name": "Water Supply",
+            "summary": transcript,
             "urgency": "Medium",
+            "location_extracted": None,
             "sentiment": "Neutral",
-            "sentiment_score": 50.0,
+            "sentiment_score": 0.0,
             "is_suspicious": False,
-            "suspicious_reason": None,
-            "location_extracted": None
+            "suspicious_reason": None
         }

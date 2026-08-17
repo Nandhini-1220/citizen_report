@@ -1,43 +1,33 @@
 import os
-import tempfile
 from faster_whisper import WhisperModel
 
-_stt_model = None
+# Use 'base' or 'small' for better multilingual accuracy (base is recommended for speed + accuracy)
+MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")
 
-def get_stt_model():
-    """
-    Lazy-loads faster-whisper base model in INT8 quantization for fast, lightweight CPU inference.
-    """
-    global _stt_model
-    if _stt_model is None:
-        print("[STT] Loading faster-whisper (base model, CPU int8)...")
-        _stt_model = WhisperModel("base", device="cpu", compute_type="int8")
-        print("[STT] Model loaded successfully.")
-    return _stt_model
+# Load model once on CPU / CUDA
+whisper_model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
 
 def transcribe_and_translate_audio(audio_path: str) -> dict:
     """
-    Transcribes and auto-translates spoken audio from any language to clean English.
+    Transcribes audio in regional languages (Tamil, Hindi, Telugu, English)
+    and translates it directly into structured English text.
     """
-    if not os.path.exists(audio_path):
-        raise FileNotFoundError(f"Audio file not found at: {audio_path}")
+    # Context prompt helps Whisper understand civic vocabulary and Indian accents
+    initial_prompt = "Municipal corporation grievance regarding water leakage, potholes, drainage, streetlights, garbage, power cut, Chennai, Tamil Nadu."
 
-    model = get_stt_model()
-    
-    # task="translate" translates any spoken language directly into English
-    segments, info = model.transcribe(
+    segments, info = whisper_model.transcribe(
         audio_path,
-        task="translate",
-        beam_size=5,
-        vad_filter=True, # Filters out background silence/noise
+        task="translate",       # Automatically translates Tamil/Hindi/Telugu to English
+        initial_prompt=initial_prompt,
+        beam_size=5,            # Higher beam size prevents hallucination
+        vad_filter=True,        # Strips background silence & mic breathing noise
         vad_parameters=dict(min_silence_duration_ms=500)
     )
 
-    translated_text = " ".join([seg.text.strip() for seg in segments]).strip()
+    full_text = " ".join([segment.text for segment in segments]).strip()
 
     return {
         "detected_language": info.language,
-        "language_probability": round(info.language_probability, 3),
-        "duration_seconds": round(info.duration, 2),
-        "translated_text": translated_text if translated_text else "Audio recording was silent or unclear."
+        "language_probability": info.language_probability,
+        "translated_text": full_text
     }

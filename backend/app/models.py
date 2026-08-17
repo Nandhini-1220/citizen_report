@@ -1,59 +1,75 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Text
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.orm import relationship
 from datetime import datetime
-from app.database import Base  # <--- Make sure it imports from app.database
+from app.database import Base
 
 class Department(Base):
     __tablename__ = "departments"
+
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, index=True)
-    sla_hours = Column(Integer, default=24)
-    username = Column(String, unique=True)
-    password_hash = Column(String)
+    username = Column(String, unique=True, nullable=True)
+    password_hash = Column(String, nullable=True)
 
-    complaints = relationship("Complaint", back_populates="dept")
+    complaints = relationship("Complaint", back_populates="department")
+
 
 class Complaint(Base):
     __tablename__ = "complaints"
+
     id = Column(Integer, primary_key=True, index=True)
     ticket_id = Column(String, unique=True, index=True)
+    department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
+
+    category = Column(String)
+    summary = Column(Text)
     raw_transcript = Column(Text, nullable=True)
-    translated_transcript = Column(Text, nullable=True)
-    summary = Column(Text, nullable=False)
-    category = Column(String, index=True)
     urgency = Column(String, default="Medium")
+
     sentiment = Column(String, default="Neutral")
-    sentiment_score = Column(Float, default=50.0)
+    sentiment_score = Column(Float, default=0.0)
     is_suspicious = Column(Boolean, default=False)
-    suspicious_reason = Column(Text, nullable=True)
-    department_id = Column(Integer, ForeignKey("departments.id"))
-    lat = Column(Float, nullable=False)
-    lng = Column(Float, nullable=False)
+    suspicious_reason = Column(String, nullable=True)
+
+    lat = Column(Float)
+    lng = Column(Float)
     location_name = Column(String, nullable=True)
+
     status = Column(String, default="REGISTERED")
     report_count = Column(Integer, default=1)
     assigned_officer = Column(String, nullable=True)
+
+    # 5-Star Feedback Fields
+    rating = Column(Integer, nullable=True)
+    feedback_notes = Column(Text, nullable=True)
+    feedback_submitted_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
     acknowledged_at = Column(DateTime, nullable=True)
     deadline_set = Column(DateTime, nullable=True)
     resolved_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
 
-    dept = relationship("Department", back_populates="complaints")
-    subscribers = relationship("CallerSubscriber", back_populates="complaint", cascade="all, delete-orphan")
+    department = relationship("Department", back_populates="complaints")
+    subscribers = relationship("CallerSubscriber", back_populates="complaint")
+
 
 class CallerSubscriber(Base):
     __tablename__ = "caller_subscribers"
+
     id = Column(Integer, primary_key=True, index=True)
     complaint_id = Column(Integer, ForeignKey("complaints.id"))
     phone_number = Column(String, index=True)
-    registered_at = Column(DateTime, default=datetime.utcnow)
+    subscribed_at = Column(DateTime, default=datetime.utcnow, nullable=True)
 
     complaint = relationship("Complaint", back_populates="subscribers")
 
+
 class SMSLog(Base):
     __tablename__ = "sms_logs"
+
     id = Column(Integer, primary_key=True, index=True)
-    recipient_phone = Column(String, nullable=False)
-    ticket_id = Column(String, nullable=False)
-    message = Column(Text, nullable=False)
+    recipient_phone = Column(String)
+    complaint_id = Column(Integer, nullable=True)
+    message = Column(Text)
+    status = Column(String, default="SENT")
     sent_at = Column(DateTime, default=datetime.utcnow)
