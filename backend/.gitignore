@@ -4,21 +4,25 @@ venv/
 __pycache__/
 *.py[cod]
 
-# Environment variables
+# Environment
 .env
 .env.*
 
-# Node
-node_modules/
-frontend/dist/
+# Database
+*.db
+*.sqlite
+*.sqlite3
 
 # IDE
 .vscode/
 .idea/
 
-# Python cache
+# Testing
 .pytest_cache/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Uploaded files
+uploads/

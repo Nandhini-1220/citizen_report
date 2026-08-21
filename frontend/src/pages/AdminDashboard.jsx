@@ -19,9 +19,18 @@ import {
   X,
   Eye,
   ShieldCheck,
+  Ban,
   Image as ImageIcon
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
+
+// Configure Default Leaflet Marker Icons
+delete L.Icon.Default.prototype._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
+  iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+  shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+});
 
 export default function AdminDashboard() {
   const navigate = useNavigate();
@@ -38,6 +47,8 @@ export default function AdminDashboard() {
   const mapContainerRef = useRef(null);
   const mapInstanceRef = useRef(null);
   const heatLayerRef = useRef(null);
+  const markersLayerRef = useRef(null);
+  const hasUserPannedRef = useRef(false);
 
   const fetchDashboardData = async () => {
     try {
@@ -53,7 +64,7 @@ export default function AdminDashboard() {
       if (feedRes.status === 'fulfilled' && Array.isArray(feedRes.value.data)) {
         const items = feedRes.value.data;
         setComplaints(items);
-        updateHeatmap(items);
+        updateMapElements(items);
       }
     } catch (err) {
       console.error('Error fetching dashboard telemetry:', err);
@@ -62,29 +73,80 @@ export default function AdminDashboard() {
     }
   };
 
-  const updateHeatmap = (items) => {
-    if (!mapInstanceRef.current || typeof L.heatLayer !== 'function') return;
+  const updateMapElements = (items) => {
+    if (!mapInstanceRef.current) return;
+    const map = mapInstanceRef.current;
 
-    const points = items.map(c => {
-      let weight = 0.5;
+    const validItems = items.filter(c => 
+      c.status !== 'FAKE_CALL' && 
+      typeof c.lat === 'number' && 
+      typeof c.lng === 'number' && 
+      !isNaN(c.lat) && 
+      !isNaN(c.lng)
+    );
+    if (validItems.length === 0) return;
+
+    // 1. Update Heatmap Layer
+    const points = validItems.map(c => {
+      let weight = 0.6;
       if (c.urgency === 'Emergency') weight = 1.0;
       else if (c.urgency === 'High') weight = 0.8;
-      return [c.lat || 12.9852, c.lng || 80.2079, weight];
+      return [c.lat, c.lng, weight];
     });
 
     try {
-      if (heatLayerRef.current) {
-        heatLayerRef.current.setLatLngs(points);
-      } else if (points.length > 0) {
-        heatLayerRef.current = L.heatLayer(points, {
-          radius: 25,
-          blur: 15,
-          maxZoom: 16,
-          gradient: { 0.4: '#3b82f6', 0.7: '#f59e0b', 1.0: '#ef4444' }
-        }).addTo(mapInstanceRef.current);
+      if (typeof L.heatLayer === 'function') {
+        if (heatLayerRef.current) {
+          heatLayerRef.current.setLatLngs(points);
+        } else {
+          heatLayerRef.current = L.heatLayer(points, {
+            radius: 28,
+            blur: 16,
+            maxZoom: 16,
+            gradient: { 0.4: '#3b82f6', 0.7: '#f59e0b', 1.0: '#ef4444' }
+          }).addTo(map);
+        }
       }
     } catch (e) {
-      console.warn('Heatmap rendering notice:', e);
+      console.warn('Heatmap layer update warning:', e);
+    }
+
+    // 2. Update Markers
+    if (markersLayerRef.current) {
+      markersLayerRef.current.clearLayers();
+    } else {
+      markersLayerRef.current = L.layerGroup().addTo(map);
+    }
+
+    validItems.forEach(c => {
+      const isEmergency = c.urgency === 'Emergency';
+      const isPending = c.status === 'PENDING_VERIFICATION';
+      const color = isEmergency ? '#ef4444' : isPending ? '#9333ea' : '#0b3c5d';
+
+      const customMarker = L.circleMarker([c.lat, c.lng], {
+        radius: isEmergency ? 9 : 7,
+        fillColor: color,
+        color: '#ffffff',
+        weight: 2,
+        opacity: 1,
+        fillOpacity: 0.9
+      });
+
+      customMarker.bindPopup(`
+        <div style="font-family: sans-serif; font-size: 12px; padding: 2px;">
+          <strong style="color: #0b3c5d;">#${c.ticket_id}</strong> - <span>${c.category}</span><br/>
+          <span style="font-size: 11px; color: #475569;">${c.summary || ''}</span><br/>
+          <strong style="font-size: 10px; color: ${color}; text-transform: uppercase;">${c.status} (${c.urgency})</strong>
+        </div>
+      `);
+
+      markersLayerRef.current.addLayer(customMarker);
+    });
+
+    // 3. Auto-Fit View
+    if (!hasUserPannedRef.current && validItems.length > 0) {
+      const bounds = L.latLngBounds(validItems.map(c => [c.lat, c.lng]));
+      map.fitBounds(bounds, { padding: [40, 40], maxZoom: 14 });
     }
   };
 
@@ -99,6 +161,11 @@ export default function AdminDashboard() {
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
           attribution: '&copy; OpenStreetMap contributors'
         }).addTo(map);
+
+        map.on('dragstart', () => {
+          hasUserPannedRef.current = true;
+        });
+
         mapInstanceRef.current = map;
       }
     }
@@ -112,6 +179,7 @@ export default function AdminDashboard() {
         mapInstanceRef.current.remove();
         mapInstanceRef.current = null;
         heatLayerRef.current = null;
+        markersLayerRef.current = null;
       }
     };
   }, []);
@@ -125,7 +193,7 @@ export default function AdminDashboard() {
         setReviewingTicket(res.data);
       }
     } catch (err) {
-      console.warn('Could not fetch single complaint fresh state, using feed record:', err);
+      console.warn('Could not fetch single record:', err);
     } finally {
       setFetchingProof(false);
     }
@@ -145,6 +213,29 @@ export default function AdminDashboard() {
       fetchDashboardData();
     } catch (e) {
       alert("Failed to submit verification status.");
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  // Trigger Fake Call & Blacklist Action
+  const handleMarkFakeCall = async (ticketId) => {
+    const confirmBlock = window.confirm(
+      `Confirm marking Ticket #${ticketId} as a FAKE CALL? This will permanently blacklist the caller's mobile number from lodging further complaints.`
+    );
+    if (!confirmBlock) return;
+
+    setVerifying(true);
+    try {
+      const formData = new FormData();
+      formData.append('reason', 'Inspected by officer and confirmed non-existent / fraudulent complaint.');
+
+      await axios.post(`http://localhost:8001/api/admin/mark-fake/${ticketId}`, formData);
+      alert(`Ticket #${ticketId} has been marked as FAKE CALL and caller number is now blacklisted.`);
+      setReviewingTicket(null);
+      fetchDashboardData();
+    } catch (err) {
+      alert("Failed to mark ticket as fake call.");
     } finally {
       setVerifying(false);
     }
@@ -184,11 +275,11 @@ export default function AdminDashboard() {
   return (
     <div className="min-h-screen bg-[#f4f6f9] text-slate-800 flex flex-col justify-between font-sans">
       <div>
-        {/* Top National Strip */}
+        {/* National Top Strip */}
         <div className="h-1.5 bg-gradient-to-r from-orange-500 via-white to-green-600 w-full" />
         <div className="bg-[#0b3c5d] text-white py-2 px-6 text-xs md:text-sm flex justify-between items-center font-bold tracking-wide">
           <span>GOVERNMENT OF CITIZEN SERVICES • MUNICIPAL COMMAND CENTER</span>
-          <span>ADMINISTRATIVE OVERSIGHT & AUDIT VERIFICATION</span>
+          <span>ADMINISTRATIVE OVERSIGHT & FRAUD ENFORCEMENT</span>
         </div>
 
         <div className="max-w-7xl mx-auto px-4 py-8 space-y-8">
@@ -199,7 +290,7 @@ export default function AdminDashboard() {
               <h1 className="text-xl md:text-2xl font-bold text-[#0b3c5d] flex items-center gap-2">
                 <Activity className="w-6 h-6 text-emerald-600" /> Municipal Command & Verification Ledger
               </h1>
-              <p className="text-xs text-slate-500 mt-1 font-medium">Real-Time City Density & Field Photo Verification Desk</p>
+              <p className="text-xs text-slate-500 mt-1 font-medium">Real-Time City Density, Field Photo Proof & Fraud Blacklisting</p>
             </div>
 
             <div className="flex items-center gap-3 flex-wrap">
@@ -241,12 +332,23 @@ export default function AdminDashboard() {
             </div>
           </div>
 
-          {/* Map + Summary */}
+          {/* Map + Telemetry */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             <div className="lg:col-span-2 bg-white border border-slate-300 rounded-xl p-5 shadow-sm flex flex-col space-y-3">
-              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
-                <MapPin className="w-4 h-4 text-red-600" /> City Incident Density Map
-              </h3>
+              <div className="flex justify-between items-center">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700 flex items-center gap-1.5">
+                  <MapPin className="w-4 h-4 text-red-600" /> City Incident Density Map & Active Pin Locations
+                </h3>
+                <button
+                  onClick={() => {
+                    hasUserPannedRef.current = false;
+                    updateMapElements(complaints);
+                  }}
+                  className="text-[11px] font-bold text-[#0b3c5d] hover:underline"
+                >
+                  Recenter All Incidents
+                </button>
+              </div>
               <div ref={mapContainerRef} className="h-80 w-full rounded border border-slate-200 overflow-hidden" />
             </div>
 
@@ -269,8 +371,8 @@ export default function AdminDashboard() {
                     <span className="font-bold text-[#0b3c5d]">Groq LPU</span>
                   </div>
                   <div className="flex justify-between text-slate-600">
-                    <span>Geo-Verification:</span>
-                    <span className="font-bold text-purple-700">Enabled (Photo + GPS)</span>
+                    <span>Fraud Blacklisting:</span>
+                    <span className="font-bold text-red-600">Enforced</span>
                   </div>
                 </div>
               </div>
@@ -293,7 +395,7 @@ export default function AdminDashboard() {
           <div className="bg-white border border-slate-300 rounded-xl shadow-md overflow-hidden">
             <div className="px-6 py-4 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
               <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700">
-                City-Wide Live Incident Ledger & Proof Verification
+                City-Wide Live Incident Ledger & Verification
               </h3>
             </div>
             <div className="overflow-x-auto">
@@ -324,6 +426,7 @@ export default function AdminDashboard() {
                           <span className={`px-2.5 py-1 rounded text-[10px] font-bold ${
                             item.status === 'RESOLVED' ? 'bg-emerald-100 text-emerald-800 border border-emerald-300' :
                             item.status === 'PENDING_VERIFICATION' ? 'bg-purple-100 text-purple-800 border border-purple-300 font-extrabold animate-pulse' :
+                            item.status === 'FAKE_CALL' ? 'bg-red-100 text-red-800 border border-red-300 font-bold' :
                             item.status === 'ACKNOWLEDGED' ? 'bg-blue-100 text-blue-800' :
                             'bg-slate-100 text-slate-700'
                           }`}>
@@ -331,16 +434,33 @@ export default function AdminDashboard() {
                           </span>
                         </td>
                         <td className="p-4 text-right">
-                          {item.status === 'PENDING_VERIFICATION' ? (
-                            <button
-                              onClick={() => handleOpenReview(item)}
-                              className="px-3.5 py-1.5 bg-purple-700 hover:bg-purple-800 text-white rounded-md font-bold text-xs flex items-center gap-1.5 ml-auto shadow-sm transition"
-                            >
-                              <Eye className="w-3.5 h-3.5" /> Review Proof
-                            </button>
-                          ) : (
-                            <span className="text-slate-400 font-semibold">Verified / Idle</span>
-                          )}
+                          <div className="flex items-center justify-end gap-2">
+                            {item.status === 'PENDING_VERIFICATION' && (
+                              <button
+                                onClick={() => handleOpenReview(item)}
+                                className="px-3 py-1.5 bg-purple-700 hover:bg-purple-800 text-white rounded-md font-bold text-xs flex items-center gap-1 shadow-sm transition"
+                              >
+                                <Eye className="w-3.5 h-3.5" /> Review Proof
+                              </button>
+                            )}
+
+                            {item.status !== 'FAKE_CALL' && item.status !== 'RESOLVED' && (
+                              <button
+                                onClick={() => handleMarkFakeCall(item.ticket_id)}
+                                className="px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-700 border border-red-300 rounded-md font-bold text-xs flex items-center gap-1 transition"
+                                title="Mark as Fake Call and block caller"
+                              >
+                                <Ban className="w-3.5 h-3.5" /> Fake Call
+                              </button>
+                            )}
+
+                            {item.status === 'RESOLVED' && (
+                              <span className="text-slate-400 font-semibold">Verified / Idle</span>
+                            )}
+                            {item.status === 'FAKE_CALL' && (
+                              <span className="text-red-600 font-bold">Blacklisted</span>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     ))
@@ -369,7 +489,7 @@ export default function AdminDashboard() {
                 </p>
 
                 <div className="space-y-4 text-xs">
-                  {/* Photo Preview Container */}
+                  {/* Photo Preview */}
                   <div>
                     <label className="block text-slate-700 font-bold mb-2">Officer Uploaded Proof Image</label>
                     {fetchingProof ? (
@@ -423,12 +543,20 @@ export default function AdminDashboard() {
                   )}
 
                   {/* Decision Actions */}
-                  <div className="flex gap-3 pt-4 border-t border-slate-200 mt-6">
+                  <div className="flex flex-col sm:flex-row gap-3 pt-4 border-t border-slate-200 mt-6">
+                    <button
+                      type="button"
+                      disabled={verifying}
+                      onClick={() => handleMarkFakeCall(reviewingTicket.ticket_id)}
+                      className="py-3 px-4 rounded-lg bg-red-100 hover:bg-red-200 text-red-800 font-bold text-xs flex items-center justify-center gap-1.5 transition disabled:opacity-50"
+                    >
+                      <Ban className="w-4 h-4" /> Fake Call & Block
+                    </button>
                     <button
                       type="button"
                       disabled={verifying}
                       onClick={() => handleAdminVerify('REJECT')}
-                      className="flex-1 py-3 rounded-lg bg-red-100 hover:bg-red-200 text-red-800 font-bold text-xs flex items-center justify-center gap-1.5 transition disabled:opacity-50"
+                      className="flex-1 py-3 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-xs flex items-center justify-center gap-1.5 transition disabled:opacity-50"
                     >
                       <X className="w-4 h-4" /> Reject Proof (Send Back)
                     </button>

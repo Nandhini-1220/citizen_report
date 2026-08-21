@@ -4,7 +4,6 @@ import re
 import uuid
 import shutil
 import tempfile
-import requests
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -30,7 +29,7 @@ from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 
 from app.database import engine, SessionLocal, Base, get_db
-from app.models import Complaint, Department, CallerSubscriber, SMSLog
+from app.models import Complaint, Department, CallerSubscriber, SMSLog, BlacklistedNumber
 from app.services.stt_service import transcribe_and_translate_audio
 from app.services.llm_service import extract_complaint_intelligence
 from app.services.dedupe_service import (
@@ -113,8 +112,8 @@ auto_upgrade_schema()
 # -------------------------------------------------------------
 app = FastAPI(
     title="Municipal Voice AI Grievance Platform",
-    description="Multilingual citizen grievance intake with STT, cognitive NLP routing, FAISS deduplication, SMS dispatch, geo-proof resolution, and admin triage verification.",
-    version="2.5.0"
+    description="Multilingual citizen grievance intake with STT, cognitive NLP routing, FAISS deduplication, SMS dispatch, geo-proof resolution, and admin fraud enforcement.",
+    version="2.6.0"
 )
 
 app.add_middleware(
@@ -125,7 +124,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Upload directory setup
+# Upload directory setup for proof images
 UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
@@ -133,7 +132,7 @@ app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 @app.on_event("startup")
 def startup_event():
-    """Sync in-memory FAISS semantic index and guarantee seeded accounts on boot."""
+    """Sync in-memory FAISS semantic index and guarantee seeded department accounts on boot."""
     db = SessionLocal()
     try:
         active_tickets = db.query(Complaint).all()
@@ -244,6 +243,19 @@ async def ingest_voice_call(
     lng: float = Form(80.2707),
     db: Session = Depends(get_db)
 ):
+    clean_phone = caller_phone.replace("+91", "").replace("+", "").strip()
+
+    # Block calls from blacklisted/fake call numbers
+    is_blocked = db.query(BlacklistedNumber).filter(
+        BlacklistedNumber.phone_number.like(f"%{clean_phone}%")
+    ).first()
+
+    if is_blocked:
+        raise HTTPException(
+            status_code=403,
+            detail="This mobile number has been blacklisted by Municipal Administration due to prior fraudulent/fake reporting."
+        )
+
     suffix = os.path.splitext(audio.filename)[1] or ".webm"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(await audio.read())
@@ -277,7 +289,9 @@ async def ingest_voice_call(
         category_text = intel.get("category") or "General Issue"
         urgency_text = intel.get("urgency") or "Medium"
 
-        active_dict = {c.id: c for c in db.query(Complaint).filter(Complaint.status != "RESOLVED").all()}
+        active_dict = {
+            c.id: c for c in db.query(Complaint).filter(Complaint.status.notin_(["RESOLVED", "FAKE_CALL"])).all()
+        }
         duplicate = find_duplicate_complaint(summary_text, lat, lng, active_dict)
 
         if duplicate:
@@ -511,11 +525,12 @@ async def resolve_with_proof(
     return {
         "status": "SUCCESS",
         "message": "Resolution photo proof uploaded successfully. Awaiting Admin verification.",
-        "ticket_id": comp.ticket_id
+        "ticket_id": comp.ticket_id,
+        "resolution_image": comp.resolution_image
     }
 
 
-# Fallback direct resolve endpoint
+# Direct resolve endpoint fallback
 @app.post("/api/officer/resolve/{ticket_id}")
 def resolve_complaint(ticket_id: str, db: Session = Depends(get_db)):
     comp = db.query(Complaint).filter(Complaint.ticket_id == ticket_id).first()
@@ -539,7 +554,7 @@ def resolve_complaint(ticket_id: str, db: Session = Depends(get_db)):
 
 
 # -------------------------------------------------------------
-# 4. ADMIN VERIFICATION & COMPLETION WORKFLOW
+# 4. ADMIN VERIFICATION, APPROVAL & FAKE CALL BLACKLISTING
 # -------------------------------------------------------------
 @app.post("/api/admin/verify-and-complete/{ticket_id}")
 def admin_verify_and_complete(
@@ -575,6 +590,53 @@ def admin_verify_and_complete(
         "ticket_id": comp.ticket_id,
         "new_status": comp.status,
         "is_verified": comp.is_verified_by_admin
+    }
+
+
+@app.post("/api/admin/mark-fake/{ticket_id}")
+def mark_fake_call(
+    ticket_id: str,
+    reason: str = Form("Inspected by officer and confirmed non-existent / fraudulent complaint."),
+    db: Session = Depends(get_db)
+):
+    comp = db.query(Complaint).filter(Complaint.ticket_id == ticket_id).first()
+    if not comp:
+        raise HTTPException(status_code=404, detail="Grievance record not found.")
+
+    comp.status = "FAKE_CALL"
+    comp.is_verified_by_admin = False
+
+    blocked_numbers = []
+    for sub in comp.subscribers:
+        phone = getattr(sub, "phone_number", None) or getattr(sub, "phone", "")
+        if phone:
+            clean_p = phone.replace("+91", "").replace("+", "").strip()
+            existing = db.query(BlacklistedNumber).filter(
+                BlacklistedNumber.phone_number.like(f"%{clean_p}%")
+            ).first()
+
+            if not existing:
+                blocked_entry = BlacklistedNumber(
+                    phone_number=phone,
+                    reason=reason,
+                    ticket_id=comp.ticket_id
+                )
+                db.add(blocked_entry)
+                blocked_numbers.append(phone)
+
+            # Warning SMS Notification
+            send_sms_notification(
+                db, phone, comp.ticket_id,
+                f"NOTICE: Incident #{comp.ticket_id} was inspected by field officers and verified as FALSE/FAKE. This number has been blocked from municipal services."
+            )
+
+    db.commit()
+    db.refresh(comp)
+
+    return {
+        "status": "SUCCESS",
+        "message": f"Ticket #{comp.ticket_id} marked as FAKE_CALL.",
+        "blocked_numbers": blocked_numbers
     }
 
 
@@ -662,7 +724,7 @@ def handle_inbound_sms_feedback(
 @app.get("/api/dashboard/overview")
 def get_dashboard_overview(db: Session = Depends(get_db)):
     total = db.query(Complaint).count()
-    active = db.query(Complaint).filter(Complaint.status != "RESOLVED").count()
+    active = db.query(Complaint).filter(Complaint.status.notin_(["RESOLVED", "FAKE_CALL"])).count()
     resolved = db.query(Complaint).filter(Complaint.status == "RESOLVED").count()
     emergency = db.query(Complaint).filter(Complaint.urgency.in_(["Emergency", "High"])).count()
 

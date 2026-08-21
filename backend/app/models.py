@@ -32,7 +32,7 @@ class Complaint(Base):
     lat = Column(Float)
     lng = Column(Float)
     location_name = Column(String, nullable=True)
-    status = Column(String, default="REGISTERED")
+    status = Column(String, default="REGISTERED")  # REGISTERED, ACKNOWLEDGED, PENDING_VERIFICATION, RESOLVED, FAKE_CALL
     report_count = Column(Integer, default=1)
     assigned_officer = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -63,6 +63,16 @@ class CallerSubscriber(Base):
     subscribed_at = Column(DateTime, default=datetime.utcnow, nullable=True)
 
     complaint = relationship("Complaint", back_populates="subscribers")
+
+
+class BlacklistedNumber(Base):
+    __tablename__ = "blacklisted_numbers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    phone_number = Column(String, unique=True, index=True)
+    reason = Column(String, default="Marked as fake/fraudulent complaint by municipal administration.")
+    blacklisted_at = Column(DateTime, default=datetime.utcnow)
+    ticket_id = Column(String, nullable=True)
 
 
 class SMSLog(Base):

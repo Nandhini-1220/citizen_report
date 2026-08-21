@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Citizen Call Intelligence Dashboard</title>
+    <!-- Google Fonts for typography -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Leaflet (for Heatmap) -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+    <!-- Material Icons (Outlined) for a modern look -->
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Outlined" rel="stylesheet">
+    
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="logo-container">
+                <span class="material-icons-outlined logo-icon">graphic_eq</span>
+                <span class="logo-text">Dashboard</span>
+            </div>
+            <nav class="nav-menu">
+                <a href="#" class="nav-item active"><span class="material-icons-outlined">grid_view</span> Dashboard</a>
+                <a href="#" class="nav-item"><span class="material-icons-outlined">insert_chart_outlined</span> Analytics</a>
+                <a href="#" class="nav-item"><span class="material-icons-outlined">description</span> Reports</a>
+                <a href="#" class="nav-item"><span class="material-icons-outlined">group</span> Agents</a>
+                <a href="#" class="nav-item"><span class="material-icons-outlined">map</span> Heatmaps</a>
+                <a href="#" class="nav-item"><span class="material-icons-outlined">settings</span> Settings</a>
+            </nav>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Topbar -->
+            <header class="topbar">
+                <h1 class="page-title">AI Citizen Call Intelligence Dashboard</h1>
+                <div class="topbar-actions">
+                    <div class="search-bar">
+                        <span class="material-icons-outlined search-icon">search</span>
+                        <input type="text" placeholder="Search">
+                    </div>
+                    <button class="icon-btn"><span class="material-icons-outlined">notifications</span></button>
+                    <div class="user-profile">
+                        <span class="material-icons-outlined">account_circle</span>
+                        <span>Admin User</span>
+                        <span class="material-icons-outlined">expand_more</span>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Dashboard Content -->
+            <div class="dashboard-scroll-area">
+                
+                <!-- Overview Metrics -->
+                <section class="overview-section">
+                    <h2 class="section-title">Overview Metrics</h2>
+                    <div class="metrics-grid">
+                        <!-- Metric Card 1 -->
+                        <div class="metric-card">
+                            <div class="card-header">
+                                <span class="card-title">Total Complaints (Today)</span>
+                                <span class="material-icons-outlined icon-btn-small">more_horiz</span>
+                            </div>
+                            <div class="card-body">
+                                <span class="metric-value" id="metric-total">--</span>
+                                <span class="metric-trend up"><span class="material-icons-outlined">arrow_upward</span>5.2%</span>
+                                <div class="mini-chart"><canvas id="miniChart1"></canvas></div>
+                            </div>
+                        </div>
+                        
+                        <!-- Metric Card 2 -->
+                        <div class="metric-card">
+                            <div class="card-header">
+                                <span class="card-title">Avg. Resolution Time</span>
+                                <span class="ai-badge"><span class="material-icons-outlined">auto_awesome</span> AI Insights</span>
+                            </div>
+                            <div class="card-body">
+                                <span class="metric-value" id="metric-resolution">--</span>
+                                <span class="metric-trend down"><span class="material-icons-outlined">arrow_downward</span>-11m</span>
+                            </div>
+                        </div>
+
+                        <!-- Metric Card 3 -->
+                        <div class="metric-card border-warning">
+                            <div class="card-header">
+                                <span class="card-title">Escalated Calls</span>
+                                <span class="material-icons-outlined icon-warning">warning_amber</span>
+                            </div>
+                            <div class="card-body">
+                                <span class="metric-value" id="metric-escalated">--</span>
+                                <span class="metric-trend up-warning"><span class="material-icons-outlined">arrow_upward</span>+2.1%</span>
+                            </div>
+                        </div>
+
+                        <!-- Metric Card 4 -->
+                        <div class="metric-card">
+                            <div class="card-header">
+                                <span class="card-title">AI Routing Accuracy</span>
+                                <span class="ai-badge"><span class="material-icons-outlined">auto_awesome</span> AI Insights</span>
+                            </div>
+                            <div class="card-body">
+                                <span class="metric-value" id="metric-accuracy">--</span>
+                                <span class="material-icons-outlined icon-target">track_changes</span>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Analytics Row -->
+                <div class="analytics-row">
+                    <!-- Complaint Analytics -->
+                    <section class="card complaint-analytics-card">
+                        <div class="card-header-flex">
+                            <h2 class="section-title">Complaint Analytics</h2>
+                            <span class="ai-badge"><span class="material-icons-outlined">auto_awesome</span> AI Insights</span>
+                        </div>
+                        <div class="analytics-charts-grid">
+                            <div class="chart-container">
+                                <h3>Complaint Categories (Volume & SLA)</h3>
+                                <canvas id="categoriesChart"></canvas>
+                                <div class="chart-legend">
+                                    <span class="legend-item"><span class="dot green"></span> Within SLA</span>
+                                    <span class="legend-item"><span class="dot red"></span> SLA Breached</span>
+                                </div>
+                            </div>
+                            <div class="chart-container">
+                                <h3>Sentiment Distribution</h3>
+                                <canvas id="sentimentChart"></canvas>
+                                <div class="chart-legend inline">
+                                    <span class="legend-item"><span class="dot green"></span> Positive</span>
+                                    <span class="legend-item"><span class="dot gray"></span> Neutral</span>
+                                    <span class="legend-item"><span class="dot red"></span> Negative</span>
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Complaint Heatmap -->
+                    <section class="card heatmap-card">
+                        <div class="card-header-flex">
+                            <h2 class="section-title">Complaint Heatmap</h2>
+                            <span class="ai-badge"><span class="material-icons-outlined">auto_awesome</span> AI Insights</span>
+                        </div>
+                        <div class="heatmap-header">
+                            <span class="heatmap-title">Citizen Complaint Heatmap</span>
+                            <div class="date-pills">
+                                <span>Date Range</span>
+                                <button class="pill active">Today</button>
+                                <button class="pill">7 days</button>
+                                <button class="pill">30 days</button>
+                            </div>
+                        </div>
+                        <div class="map-container-wrapper">
+                            <div id="heatmap"></div>
+                            <div class="map-overlay-controls">
+                                <div class="map-filter">
+                                    <label>Category</label>
+                                    <select><option>All areas</option></select>
+                                </div>
+                                <div class="map-filter">
+                                    <label>Category</label>
+                                    <select><option>Category</option></select>
+                                </div>
+                            </div>
+                            <div class="map-legend">
+                                <span>Citizen Complaint Heatmap</span>
+                                <div class="gradient-bar"></div>
+                                <div class="legend-labels"><span>Low</span><span>High</span></div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <!-- Bottom Row -->
+                <div class="bottom-row">
+                    <!-- AI Call Routing -->
+                    <section class="card routing-card">
+                        <div class="card-header-flex">
+                            <h2 class="section-title">AI Call Routing & Agent Activity</h2>
+                        </div>
+                        <div class="live-feed-header">
+                            <h3>AI Call Routing Live Status</h3>
+                            <span class="live-indicator"><span class="pulse"></span> Live feed</span>
+                        </div>
+                        <div class="live-feed-list" id="live-feed-container">
+                            <!-- Populated via JS -->
+                        </div>
+                        <div class="agent-availability">
+                            <h3>Agent Availability</h3>
+                            <div class="agent-stats">
+                                <span class="legend-item"><span class="dot green"></span> Available: 42</span>
+                                <span class="legend-item"><span class="dot warning"></span> Busy: 11</span>
+                                <span class="legend-item"><span class="dot red"></span> Offline: 5</span>
+                            </div>
+                        </div>
+                    </section>
+
+                    <!-- Historical Trends -->
+                    <section class="card trends-card">
+                        <div class="card-header-flex">
+                            <h2 class="section-title">Historical Trends</h2>
+                            <span class="ai-badge"><span class="material-icons-outlined">auto_awesome</span> AI Insights</span>
+                        </div>
+                        <div class="trends-header">
+                            <h3>Complaint Volume Trend (7 Days)</h3>
+                            <div class="chart-legend inline">
+                                <span class="legend-item line-blue"> Total calls</span>
+                                <span class="legend-item line-green"> AI-resolved</span>
+                            </div>
+                        </div>
+                        <div class="trends-chart-container">
+                            <canvas id="trendsChart"></canvas>
+                        </div>
+                    </section>
+                </div>
+
+            </div>
+        </main>
+    </div>
+
+    <script src="/js/charts.js"></script>
+    <script src="/js/app.js"></script>
+</body>
+</html>
