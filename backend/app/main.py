@@ -1,12 +1,9 @@
-import io
-from fastapi.responses import StreamingResponse
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-from reportlab.lib import colors
+import os
 import io
 import re
-import tempfile
 import uuid
+import shutil
+import tempfile
 import requests
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
@@ -23,14 +20,14 @@ from fastapi import (
     status
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import func, text, desc, or_
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.pdfgen import canvas
 
 from app.database import engine, SessionLocal, Base, get_db
 from app.models import Complaint, Department, CallerSubscriber, SMSLog
@@ -71,7 +68,7 @@ def auto_upgrade_schema():
         except Exception:
             pass
 
-        # 3. Upgrade complaints table
+        # 3. Upgrade complaints table (ratings, feedback, geo-proof & admin verification)
         try:
             res = conn.execute(text("PRAGMA table_info(complaints);")).fetchall()
             cols = [r[1] for r in res]
@@ -82,6 +79,16 @@ def auto_upgrade_schema():
                     conn.execute(text("ALTER TABLE complaints ADD COLUMN feedback_notes TEXT;"))
                 if "feedback_submitted_at" not in cols:
                     conn.execute(text("ALTER TABLE complaints ADD COLUMN feedback_submitted_at DATETIME;"))
+                if "resolution_image" not in cols:
+                    conn.execute(text("ALTER TABLE complaints ADD COLUMN resolution_image TEXT;"))
+                if "resolution_lat" not in cols:
+                    conn.execute(text("ALTER TABLE complaints ADD COLUMN resolution_lat REAL;"))
+                if "resolution_lng" not in cols:
+                    conn.execute(text("ALTER TABLE complaints ADD COLUMN resolution_lng REAL;"))
+                if "resolved_notes" not in cols:
+                    conn.execute(text("ALTER TABLE complaints ADD COLUMN resolved_notes TEXT;"))
+                if "is_verified_by_admin" not in cols:
+                    conn.execute(text("ALTER TABLE complaints ADD COLUMN is_verified_by_admin BOOLEAN DEFAULT 0;"))
                 conn.commit()
         except Exception:
             pass
@@ -102,12 +109,12 @@ def auto_upgrade_schema():
 auto_upgrade_schema()
 
 # -------------------------------------------------------------
-# APPLICATION CONFIGURATION & MIDDLEWARE
+# APPLICATION CONFIGURATION & STATIC FILE MOUNT
 # -------------------------------------------------------------
 app = FastAPI(
     title="Municipal Voice AI Grievance Platform",
-    description="Multilingual citizen grievance intake with STT, cognitive NLP routing, FAISS deduplication, SMS dispatch, and triage workflow.",
-    version="2.4.0"
+    description="Multilingual citizen grievance intake with STT, cognitive NLP routing, FAISS deduplication, SMS dispatch, geo-proof resolution, and admin triage verification.",
+    version="2.5.0"
 )
 
 app.add_middleware(
@@ -118,17 +125,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Upload directory setup
+UPLOAD_DIR = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
 
 @app.on_event("startup")
 def startup_event():
     """Sync in-memory FAISS semantic index and guarantee seeded accounts on boot."""
     db = SessionLocal()
     try:
-        # Re-index existing active tickets
         active_tickets = db.query(Complaint).all()
         clear_and_rebuild_index(active_tickets)
 
-        # Guarantee all department accounts exist
         default_depts = [
             ("Water Supply", "water_admin", "water123"),
             ("Road Maintenance", "road_admin", "road123"),
@@ -181,7 +191,6 @@ def staff_login(payload: LoginRequest, db: Session = Depends(get_db)):
     u = payload.username.strip().lower()
     p = payload.password.strip()
 
-    # Super Admin Check
     if u == "admin" and p == "admin123":
         return {
             "status": "SUCCESS",
@@ -190,7 +199,6 @@ def staff_login(payload: LoginRequest, db: Session = Depends(get_db)):
             "department": "All"
         }
 
-    # Hardcoded officer fallback map for deterministic evaluation
     OFFICER_CREDS = {
         "water_admin": ("Water Supply", "water123"),
         "road_admin": ("Road Maintenance", "road123"),
@@ -209,7 +217,6 @@ def staff_login(payload: LoginRequest, db: Session = Depends(get_db)):
             "department": dept_name
         }
 
-    # Dynamic database officer check
     dept = db.query(Department).filter(
         (func.lower(Department.username) == u) &
         (Department.password_hash == p)
@@ -243,24 +250,18 @@ async def ingest_voice_call(
         tmp_path = tmp.name
 
     try:
-        # Step A: Multilingual STT Translation
         stt_result = transcribe_and_translate_audio(tmp_path)
-        transcript = stt_result.get("translated_text", "")
+        transcript = stt_result.get("transcript") or stt_result.get("translated_text", "")
 
-        # Step B: LLM Parameter Extraction & Guardrail Validation
         intel = extract_complaint_intelligence(transcript)
 
-        # -------------------------------------------------------------
-        # REJECT NON-CIVIC INPUTS (Apologies, computer errors, chatter)
-        # -------------------------------------------------------------
         if not intel.get("is_civic_complaint", True):
             reason = intel.get("rejection_reason") or "No municipal issue detected in recording."
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid Grievance: {reason}. Please speak clearly about a civic issue (roads, water, electricity, drainage)."
+                detail=f"Invalid Grievance: {reason}. Please state a civic issue (roads, water, electricity, sanitation)."
             )
 
-        # Step C: Safe Department Routing
         dept_name = intel.get("department_name") or "General"
         clean_dept_word = dept_name.split()[0].strip() if dept_name else "GEN"
 
@@ -272,7 +273,6 @@ async def ingest_voice_call(
         if not department:
             department = db.query(Department).first()
 
-        # Step D: Spatial & Semantic Deduplication
         summary_text = intel.get("summary") or transcript
         category_text = intel.get("category") or "General Issue"
         urgency_text = intel.get("urgency") or "Medium"
@@ -306,7 +306,6 @@ async def ingest_voice_call(
                 }
             }
 
-        # Step E: Create New Master Complaint
         dept_code = clean_dept_word[:3].upper() if clean_dept_word else "GEN"
         ticket_code = f"{dept_code}-{str(uuid.uuid4().hex[:4]).upper()}"
 
@@ -388,13 +387,18 @@ def get_complaint_status(ticket_id: str, db: Session = Depends(get_db)):
         "acknowledged_at": comp.acknowledged_at.isoformat() if comp.acknowledged_at else None,
         "deadline_set": comp.deadline_set.isoformat() if comp.deadline_set else None,
         "resolved_at": comp.resolved_at.isoformat() if comp.resolved_at else None,
+        "resolution_image": getattr(comp, "resolution_image", None),
+        "resolution_lat": getattr(comp, "resolution_lat", None),
+        "resolution_lng": getattr(comp, "resolution_lng", None),
+        "resolved_notes": getattr(comp, "resolved_notes", None),
+        "is_verified_by_admin": getattr(comp, "is_verified_by_admin", False),
         "rating": getattr(comp, "rating", None),
         "feedback_notes": getattr(comp, "feedback_notes", None)
     }
 
 
 # -------------------------------------------------------------
-# 3. OFFICER WORKSPACE & STAGE 2 / STAGE 3 SMS TRIGGERS
+# 3. OFFICER WORKSPACE, ACKNOWLEDGEMENT & GEO-PROOF UPLOAD
 # -------------------------------------------------------------
 @app.get("/api/officer/tickets")
 def get_officer_tickets(dept: str = Query("Water Supply"), db: Session = Depends(get_db)):
@@ -436,6 +440,11 @@ def get_officer_tickets(dept: str = Query("Water Supply"), db: Session = Depends
             "deadline_set": c.deadline_set.isoformat() if c.deadline_set else None,
             "resolved_at": c.resolved_at.isoformat() if c.resolved_at else None,
             "assigned_officer": c.assigned_officer,
+            "resolution_image": getattr(c, "resolution_image", None),
+            "resolution_lat": getattr(c, "resolution_lat", None),
+            "resolution_lng": getattr(c, "resolution_lng", None),
+            "resolved_notes": getattr(c, "resolved_notes", None),
+            "is_verified_by_admin": getattr(c, "is_verified_by_admin", False),
             "rating": getattr(c, "rating", None)
         }
         for c in complaints
@@ -459,7 +468,6 @@ def acknowledge_complaint(
     comp.deadline_set = datetime.utcnow() + timedelta(hours=deadline_hours)
     db.commit()
 
-    # Stage 2: SLA Commitment Notification to all subscribers
     for sub in comp.subscribers:
         phone = getattr(sub, "phone_number", None) or getattr(sub, "phone", "")
         if phone:
@@ -471,6 +479,43 @@ def acknowledge_complaint(
     return {"status": "SUCCESS", "message": "Ticket acknowledged."}
 
 
+@app.post("/api/officer/resolve-with-proof/{ticket_id}")
+async def resolve_with_proof(
+    ticket_id: str,
+    image: UploadFile = File(...),
+    resolution_lat: float = Form(...),
+    resolution_lng: float = Form(...),
+    resolved_notes: str = Form("Issue resolved by field staff."),
+    db: Session = Depends(get_db)
+):
+    comp = db.query(Complaint).filter(Complaint.ticket_id == ticket_id).first()
+    if not comp:
+        raise HTTPException(status_code=404, detail="Grievance record not found.")
+
+    clean_filename = f"proof_{ticket_id}_{uuid.uuid4().hex[:6]}_{image.filename}"
+    file_path = os.path.join(UPLOAD_DIR, clean_filename)
+    
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(image.file, buffer)
+
+    comp.status = "PENDING_VERIFICATION"
+    comp.resolution_image = f"http://localhost:8001/uploads/{clean_filename}"
+    comp.resolution_lat = resolution_lat
+    comp.resolution_lng = resolution_lng
+    comp.resolved_notes = resolved_notes
+    comp.resolved_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(comp)
+
+    return {
+        "status": "SUCCESS",
+        "message": "Resolution photo proof uploaded successfully. Awaiting Admin verification.",
+        "ticket_id": comp.ticket_id
+    }
+
+
+# Fallback direct resolve endpoint
 @app.post("/api/officer/resolve/{ticket_id}")
 def resolve_complaint(ticket_id: str, db: Session = Depends(get_db)):
     comp = db.query(Complaint).filter(Complaint.ticket_id == ticket_id).first()
@@ -479,9 +524,9 @@ def resolve_complaint(ticket_id: str, db: Session = Depends(get_db)):
 
     comp.status = "RESOLVED"
     comp.resolved_at = datetime.utcnow()
+    comp.is_verified_by_admin = True
     db.commit()
 
-    # Stage 3: Direct SMS 5-Star Rating Prompt to all subscribers
     for sub in comp.subscribers:
         phone = getattr(sub, "phone_number", None) or getattr(sub, "phone", "")
         if phone:
@@ -494,7 +539,47 @@ def resolve_complaint(ticket_id: str, db: Session = Depends(get_db)):
 
 
 # -------------------------------------------------------------
-# 4. CITIZEN 5-STAR FEEDBACK API (WEB PORTAL)
+# 4. ADMIN VERIFICATION & COMPLETION WORKFLOW
+# -------------------------------------------------------------
+@app.post("/api/admin/verify-and-complete/{ticket_id}")
+def admin_verify_and_complete(
+    ticket_id: str,
+    admin_action: str = Form("APPROVE"),
+    admin_remarks: str = Form("Verified by municipal administration."),
+    db: Session = Depends(get_db)
+):
+    comp = db.query(Complaint).filter(Complaint.ticket_id == ticket_id).first()
+    if not comp:
+        raise HTTPException(status_code=404, detail="Grievance record not found.")
+
+    if admin_action.upper() == "APPROVE":
+        comp.status = "RESOLVED"
+        comp.is_verified_by_admin = True
+
+        for sub in comp.subscribers:
+            phone = getattr(sub, "phone_number", None) or getattr(sub, "phone", "")
+            if phone:
+                send_sms_notification(
+                    db, phone, comp.ticket_id,
+                    f"Resolved: Incident #{comp.ticket_id} has been completed and verified! Reply with your rating 1-5 or visit: http://localhost:5173/feedback/{comp.ticket_id}"
+                )
+    else:
+        comp.status = "ACKNOWLEDGED"
+        comp.is_verified_by_admin = False
+
+    db.commit()
+    db.refresh(comp)
+
+    return {
+        "status": "SUCCESS",
+        "ticket_id": comp.ticket_id,
+        "new_status": comp.status,
+        "is_verified": comp.is_verified_by_admin
+    }
+
+
+# -------------------------------------------------------------
+# 5. CITIZEN 5-STAR FEEDBACK API (WEB PORTAL)
 # -------------------------------------------------------------
 @app.post("/api/complaints/{ticket_id}/feedback")
 def submit_citizen_feedback(ticket_id: str, payload: FeedbackSubmission, db: Session = Depends(get_db)):
@@ -515,7 +600,7 @@ def submit_citizen_feedback(ticket_id: str, payload: FeedbackSubmission, db: Ses
 
 
 # -------------------------------------------------------------
-# 5. INBOUND 2-WAY SMS RATING WEBHOOK (REPLY DIRECTLY VIA SMS)
+# 6. INBOUND 2-WAY SMS RATING WEBHOOK (REPLY DIRECTLY VIA SMS)
 # -------------------------------------------------------------
 @app.post("/api/sms/inbound-reply")
 def handle_inbound_sms_feedback(
@@ -526,7 +611,6 @@ def handle_inbound_sms_feedback(
     clean_body = Body.strip()
     clean_phone = From.replace("+91", "").replace("+", "").strip()
 
-    # Extract score 1 to 5 using regex
     match = re.search(r'\b([1-5])\b', clean_body)
     if not match:
         response_msg = "Invalid rating. Please reply with a single number from 1 to 5 (e.g. '5' or '4 Fast service')."
@@ -539,7 +623,6 @@ def handle_inbound_sms_feedback(
     rating_score = int(match.group(1))
     notes = clean_body.replace(match.group(1), "").strip()
 
-    # Find the caller's latest resolved complaint
     subscriber_record = (
         db.query(CallerSubscriber)
         .filter(CallerSubscriber.phone_number.like(f"%{clean_phone}%"))
@@ -574,7 +657,7 @@ def handle_inbound_sms_feedback(
 
 
 # -------------------------------------------------------------
-# 6. SUPER ADMIN COMMAND CENTER, METRICS & AUDIT PDF EXPORT
+# 7. SUPER ADMIN COMMAND CENTER, METRICS & AUDIT PDF EXPORT
 # -------------------------------------------------------------
 @app.get("/api/dashboard/overview")
 def get_dashboard_overview(db: Session = Depends(get_db)):
@@ -611,6 +694,12 @@ def get_live_feed(db: Session = Depends(get_db)):
             "report_count": c.report_count,
             "lat": c.lat,
             "lng": c.lng,
+            "location_name": c.location_name,
+            "resolution_image": getattr(c, "resolution_image", None),
+            "resolution_lat": getattr(c, "resolution_lat", None),
+            "resolution_lng": getattr(c, "resolution_lng", None),
+            "resolved_notes": getattr(c, "resolved_notes", None),
+            "is_verified_by_admin": getattr(c, "is_verified_by_admin", False),
             "rating": getattr(c, "rating", None),
             "created_at": c.created_at.isoformat() if c.created_at else None
         }
@@ -631,12 +720,10 @@ def generate_audit_report(db: Session = Depends(get_db)):
     pdf.setFont("Helvetica", 10)
     pdf.drawString(50, height - 70, "Automated Public Redressal & Field Operations Ledger")
     
-    # Divider line
     pdf.setStrokeColor(colors.HexColor("#0B3C5D"))
     pdf.setLineWidth(1.5)
     pdf.line(50, height - 80, width - 50, height - 80)
 
-    # Fetch recent complaints
     complaints = db.query(Complaint).order_by(Complaint.created_at.desc()).limit(25).all()
 
     y = height - 110

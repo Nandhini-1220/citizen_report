@@ -1,7 +1,8 @@
+from datetime import datetime
 from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.orm import relationship
-from datetime import datetime
 from app.database import Base
+
 
 class Department(Base):
     __tablename__ = "departments"
@@ -20,34 +21,34 @@ class Complaint(Base):
     id = Column(Integer, primary_key=True, index=True)
     ticket_id = Column(String, unique=True, index=True)
     department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
-
     category = Column(String)
     summary = Column(Text)
     raw_transcript = Column(Text, nullable=True)
     urgency = Column(String, default="Medium")
-
     sentiment = Column(String, default="Neutral")
     sentiment_score = Column(Float, default=0.0)
     is_suspicious = Column(Boolean, default=False)
     suspicious_reason = Column(String, nullable=True)
-
     lat = Column(Float)
     lng = Column(Float)
     location_name = Column(String, nullable=True)
-
     status = Column(String, default="REGISTERED")
     report_count = Column(Integer, default=1)
     assigned_officer = Column(String, nullable=True)
-
-    # 5-Star Feedback Fields
-    rating = Column(Integer, nullable=True)
-    feedback_notes = Column(Text, nullable=True)
-    feedback_submitted_at = Column(DateTime, nullable=True)
-
     created_at = Column(DateTime, default=datetime.utcnow)
     acknowledged_at = Column(DateTime, nullable=True)
     deadline_set = Column(DateTime, nullable=True)
     resolved_at = Column(DateTime, nullable=True)
+    rating = Column(Integer, nullable=True)
+    feedback_notes = Column(Text, nullable=True)
+    feedback_submitted_at = Column(DateTime, nullable=True)
+
+    # Resolution proof & verification metadata
+    resolution_image = Column(String, nullable=True)
+    resolution_lat = Column(Float, nullable=True)
+    resolution_lng = Column(Float, nullable=True)
+    resolved_notes = Column(Text, nullable=True)
+    is_verified_by_admin = Column(Boolean, default=False)
 
     department = relationship("Department", back_populates="complaints")
     subscribers = relationship("CallerSubscriber", back_populates="complaint")
