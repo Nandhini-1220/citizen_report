@@ -1,248 +1,323 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import React, { useState, useEffect } from 'react';
+import { Mic, MicOff, MapPin, Radio, CheckCircle2, ArrowRight, AlertCircle, HelpCircle, ShieldCheck, RefreshCw } from 'lucide-react';
 import axios from 'axios';
-import { 
-  Mic, 
-  Square, 
-  MapPin, 
-  Phone, 
-  AlertCircle, 
-  CheckCircle, 
-  Building, 
-  ShieldCheck, 
-  ArrowRight, 
-  RefreshCw, 
-  Radio,
-  Lock,
-  UserCheck
-} from 'lucide-react';
 
 export default function CitizenCallPage() {
-  const navigate = useNavigate();
-  const [phoneNumber, setPhoneNumber] = useState('9042738066');
+  const [phone, setPhone] = useState('9042738066');
   const [isRecording, setIsRecording] = useState(false);
-  const [recordingTime, setRecordingTime] = useState(0);
-  const [location, setLocation] = useState({ lat: 13.0827, lng: 80.2707, address: 'Locating via GPS...' });
-  const [processing, setProcessing] = useState(false);
-  const [result, setResult] = useState(null);
-  const [error, setError] = useState(null);
+  const [mediaRecorder, setMediaRecorder] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [createdTicket, setCreatedTicket] = useState(null);
+  const [errorMsg, setErrorMsg] = useState(null);
 
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
-  const timerRef = useRef(null);
+  // Dynamic Location State
+  const [coords, setCoords] = useState({ lat: 12.9852, lng: 80.2079 });
+  const [locationName, setLocationName] = useState('Detecting current live location...');
+  const [locating, setLocating] = useState(true);
 
-  // Initialize GPS on load
-  useEffect(() => {
-    if (navigator.geolocation) {
+  // Fetch real device location
+  const detectLiveLocation = () => {
+    setLocating(true);
+    if ('geolocation' in navigator) {
       navigator.geolocation.getCurrentPosition(
         async (pos) => {
           const lat = pos.coords.latitude;
           const lng = pos.coords.longitude;
+          setCoords({ lat, lng });
+
+          // Try reverse geocoding via OpenStreetMap Nominatim (Free, no key required)
           try {
-            const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`);
-            const data = await res.json();
-            const addr = data.display_name ? data.display_name.split(',').slice(0, 3).join(',') : `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
-            setLocation({ lat, lng, address: addr });
-          } catch {
-            setLocation({ lat, lng, address: `GPS: ${lat.toFixed(4)}, ${lng.toFixed(4)}` });
+            const res = await axios.get(
+              `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`
+            );
+            if (res.data && res.data.display_name) {
+              const parts = res.data.display_name.split(',');
+              const shortLoc = parts.slice(0, 3).join(',').trim();
+              setLocationName(shortLoc || res.data.display_name);
+            } else {
+              setLocationName(`Lat: ${lat.toFixed(4)}, Lng: ${lng.toFixed(4)}`);
+            }
+          } catch (e) {
+            setLocationName(`Lat: ${lat.toFixed(4)}, Lng: ${lng.toFixed(4)}`);
+          } finally {
+            setLocating(false);
           }
         },
-        () => {
-          setLocation({ lat: 13.0827, lng: 80.2707, address: 'Mohanapuri 4th Street, Chennai (Default)' });
-        }
+        (err) => {
+          console.warn('Geolocation error / permission denied:', err.message);
+          setLocationName('CMWSSB Division 177, Ward 177, Zone 13 Adyar (Default Fallback)');
+          setLocating(false);
+        },
+        { enableHighAccuracy: true, timeout: 10000 }
       );
+    } else {
+      setLocationName('Geolocation not supported by browser');
+      setLocating(false);
     }
+  };
+
+  useEffect(() => {
+    detectLiveLocation();
   }, []);
 
-  const startRecording = async () => {
-    setError(null);
-    setResult(null);
+  const startVoiceCapture = async () => {
+    setErrorMsg(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
+      const recorder = new MediaRecorder(stream);
+      const audioChunks = [];
 
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      recorder.ondataavailable = (e) => audioChunks.push(e.data);
+      recorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+        submitVoiceGrievance(audioBlob);
       };
 
-      mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        submitVoiceComplaint(audioBlob);
-      };
-
-      mediaRecorder.start();
+      recorder.start();
+      setMediaRecorder(recorder);
       setIsRecording(true);
-      setRecordingTime(0);
-      timerRef.current = setInterval(() => {
-        setRecordingTime((prev) => prev + 1);
-      }, 1000);
     } catch (err) {
-      setError("Microphone permission denied. Please allow microphone access.");
+      setErrorMsg("Microphone access denied. Please allow microphone permissions in your browser.");
     }
   };
 
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+  const stopVoiceCapture = () => {
+    if (mediaRecorder) {
+      mediaRecorder.stop();
       setIsRecording(false);
-      clearInterval(timerRef.current);
     }
   };
 
-  const submitVoiceComplaint = async (audioBlob) => {
-    setProcessing(true);
+  const submitVoiceGrievance = async (audioBlob) => {
+    setIsProcessing(true);
     const formData = new FormData();
     formData.append('audio', audioBlob, 'recording.webm');
-    formData.append('caller_phone', phoneNumber);
-    formData.append('lat', String(location.lat));
-    formData.append('lng', String(location.lng));
+    formData.append('caller_phone', phone);
+    // Send real detected GPS coordinates to the backend
+    formData.append('lat', coords.lat);
+    formData.append('lng', coords.lng);
 
     try {
-      const res = await axios.post('http://localhost:8001/api/complaints/call-ingest', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' }
-      });
-      setResult(res.data);
+      const res = await axios.post('http://localhost:8001/api/complaints/call-ingest', formData);
+      setCreatedTicket(res.data.complaint);
     } catch (err) {
-      setError(err.response?.data?.detail || "Failed to process voice complaint. Ensure backend is running.");
+      const msg = err.response?.data?.detail || "Could not process grievance. Ensure voice input describes a municipal issue.";
+      setErrorMsg(msg);
     } finally {
-      setProcessing(false);
+      setIsProcessing(false);
     }
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between">
+    <div className="min-h-screen bg-[#f4f6f9] flex flex-col justify-between text-slate-800 font-sans">
       
-      {/* Top Header with Prominent Staff Login Button */}
-      <header className="w-full border-b border-slate-800/80 bg-slate-900/60 px-6 py-4 flex items-center justify-between">
-        <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-lg bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
-            <Radio className="w-4 h-4" />
-          </div>
-          <div>
-            <h1 className="text-sm font-bold text-white tracking-wide">CITIZEN GRIEVANCE HELPLINE</h1>
-            <p className="text-[11px] text-slate-400">Municipal AI Voice Redressal Portal</p>
-          </div>
+      {/* Top Official National Banner */}
+      <div>
+        <div className="h-1.5 bg-gradient-to-r from-orange-500 via-white to-green-600 w-full" />
+        <div className="bg-[#0b3c5d] text-white py-2 px-6 text-xs md:text-sm flex justify-between items-center font-bold tracking-wide">
+          <span>GOVERNMENT OF CITIZEN SERVICES • MUNICIPAL ADMINISTRATION</span>
+          <span className="hidden md:inline">24x7 TOLL-FREE AI HELPLINE DISPATCH</span>
         </div>
 
-        {/* Prominent Login Button */}
-        <button
-          onClick={() => navigate('/login')}
-          className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-semibold flex items-center gap-2 transition"
-        >
-          <Lock className="w-3.5 h-3.5 text-blue-400" />
-          <span>Staff & Official Login</span>
-        </button>
-      </header>
+        {/* Header Branding */}
+        <header className="bg-white border-b border-slate-300 shadow-sm px-6 py-4">
+          <div className="max-w-6xl mx-auto flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <div className="w-12 h-12 rounded-full bg-blue-50 border-2 border-[#0b3c5d] flex items-center justify-center font-bold text-xl text-[#0b3c5d] shadow-inner">
+                🏛️
+              </div>
+              <div>
+                <h1 className="text-lg md:text-xl font-extrabold text-[#0b3c5d] leading-tight">
+                  INTEGRATED CITIZEN GRIEVANCE REDRESSAL SYSTEM
+                </h1>
+                <p className="text-xs text-slate-500 font-semibold mt-0.5">
+                  Municipal Corporation Automated Voice Intake & SLA Action Portal
+                </p>
+              </div>
+            </div>
 
-      {/* Main Container */}
-      <main className="flex-1 flex items-center justify-center p-4">
-        <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl space-y-5">
+            <div className="flex items-center gap-3">
+              <a 
+                href="/officer/login"
+                className="px-4 py-2 text-xs font-bold text-white bg-[#0b3c5d] hover:bg-[#07273d] rounded-md shadow-sm transition"
+              >
+                Officer Login
+              </a>
+              <a 
+                href="/login"
+                className="px-4 py-2 text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded-md transition"
+              >
+                Admin Oversight
+              </a>
+            </div>
+          </div>
+        </header>
+      </div>
+
+      {/* Main Grievance Lodging Body */}
+      <main className="max-w-5xl w-full mx-auto px-4 py-8">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           
-          <div className="text-center space-y-1">
-            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-              <Radio className="w-3.5 h-3.5" /> 24/7 AI Voice Intake
-            </span>
-            <h2 className="text-xl font-bold text-white pt-2">Record Your Grievance</h2>
-            <p className="text-xs text-slate-400">Speak naturally in Tamil, Hindi, English, or Telugu</p>
-          </div>
-
-          {/* Caller Location Box */}
-          <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-800 text-xs space-y-1">
-            <div className="flex items-center justify-between text-slate-400 font-semibold uppercase">
-              <span className="flex items-center gap-1">
-                <MapPin className="w-3.5 h-3.5 text-emerald-400" /> Caller Location
-              </span>
-              <span className="text-[10px] text-slate-500">Auto-Detected</span>
+          {/* Instructions */}
+          <div className="space-y-4">
+            <div className="bg-white border border-slate-300 rounded-xl p-5 shadow-sm">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-[#0b3c5d] flex items-center gap-2 border-b border-slate-100 pb-2">
+                <HelpCircle className="w-4 h-4 text-blue-600" /> How to Voice File
+              </h3>
+              <ul className="text-xs text-slate-600 space-y-2.5 mt-3 leading-relaxed font-medium">
+                <li className="flex items-start gap-2">
+                  <span className="font-bold text-[#0b3c5d]">1.</span> 
+                  Enter your active 10-digit mobile number for official SMS receipts.
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="font-bold text-[#0b3c5d]">2.</span> 
+                  Press <strong>"Start Voice Recording"</strong> and describe your issue in Tamil, Hindi, English, or Telugu.
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="font-bold text-[#0b3c5d]">3.</span> 
+                  The AI transcribes, tags your live GPS, deduplicates, and assigns an officer.
+                </li>
+              </ul>
             </div>
-            <p className="text-slate-200 font-medium truncate">{location.address}</p>
-            <p className="text-[11px] text-slate-500 font-mono">GPS: {location.lat.toFixed(4)}, {location.lng.toFixed(4)}</p>
-          </div>
 
-          {/* Phone Number Input */}
-          <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-slate-400 uppercase">
-              Your Mobile Number (For Live SMS Updates)
-            </label>
-            <div className="relative">
-              <Phone className="w-4 h-4 text-slate-500 absolute left-3.5 top-3" />
-              <input
-                type="tel"
-                value={phoneNumber}
-                onChange={(e) => setPhoneNumber(e.target.value)}
-                placeholder="10-digit mobile number"
-                className="w-full pl-10 pr-4 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-sm font-mono text-slate-100 focus:outline-none focus:border-emerald-500"
-              />
-            </div>
-          </div>
-
-          {/* Recording & Action Controls */}
-          <div className="pt-2">
-            {!isRecording && !processing && (
-              <button
-                onClick={startRecording}
-                className="w-full py-3.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl text-sm flex items-center justify-center gap-2 shadow-lg shadow-emerald-950/50 transition"
-              >
-                <Mic className="w-4 h-4" /> Start Voice Report
-              </button>
-            )}
-
-            {isRecording && (
-              <button
-                onClick={stopRecording}
-                className="w-full py-3.5 bg-red-600 hover:bg-red-500 text-white font-semibold rounded-xl text-sm flex items-center justify-center gap-2 transition"
-              >
-                <Square className="w-4 h-4 fill-current" /> Stop & Submit Recording ({recordingTime}s)
-              </button>
-            )}
-
-            {processing && (
-              <div className="w-full py-3.5 bg-slate-800 text-slate-300 font-semibold rounded-xl text-sm flex items-center justify-center gap-2 border border-slate-700">
-                <RefreshCw className="w-4 h-4 animate-spin text-emerald-400" />
-                Analyzing Speech & Routing Department...
+            <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-xs text-blue-900 flex items-start gap-2.5 font-medium">
+              <ShieldCheck className="w-5 h-5 text-blue-600 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-bold">Automated Incident Guarantee</p>
+                <p className="text-[11px] text-blue-800 mt-0.5">
+                  All grievances receive an instant tracking ID and SLA target resolution window.
+                </p>
               </div>
-            )}
+            </div>
           </div>
 
-          {/* Error Message */}
-          {error && (
-            <div className="p-3 bg-red-950/40 border border-red-800/60 rounded-xl flex items-center gap-2 text-xs text-red-300">
-              <AlertCircle className="w-4 h-4 flex-shrink-0" />
-              <span>{error}</span>
-            </div>
-          )}
-
-          {/* Success Response Banner */}
-          {result && (
-            <div className="p-4 bg-emerald-950/40 border border-emerald-800/60 rounded-xl space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold text-emerald-300 uppercase tracking-wider flex items-center gap-1">
-                  <CheckCircle className="w-4 h-4 text-emerald-400" /> 
-                  {result.status === 'MERGED_DUPLICATE' ? 'Merged with Existing Ticket' : 'Ticket Created'}
-                </span>
-                <span className="font-mono text-xs font-bold text-white bg-slate-900 px-2 py-0.5 rounded border border-slate-800">
-                  #{result.complaint.ticket_id}
-                </span>
-              </div>
-              <p className="text-xs text-slate-300 line-clamp-2">{result.complaint.summary}</p>
+          {/* Voice Intake Form */}
+          <div className="md:col-span-2">
+            <div className="bg-white border border-slate-300 rounded-xl shadow-md p-6 md:p-8">
               
-              <button
-                onClick={() => navigate(`/track/${result.complaint.ticket_id}`)}
-                className="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition"
-              >
-                Open Live Status Tracker <ArrowRight className="w-3.5 h-3.5" />
-              </button>
+              <div className="flex items-center justify-between pb-4 border-b border-slate-200 mb-5">
+                <div>
+                  <span className="inline-block px-2.5 py-0.5 bg-blue-100 text-[#0b3c5d] text-[11px] font-extrabold uppercase rounded border border-blue-200 mb-1">
+                    Direct Citizen Helpline
+                  </span>
+                  <h2 className="text-xl font-bold text-slate-900">Lodge Municipal Grievance</h2>
+                </div>
+                <div className="text-right">
+                  <span className="text-[11px] text-slate-500 font-bold block">Languages Supported</span>
+                  <span className="text-xs font-semibold text-slate-700">தமிழ் • हिंदी • English • తెలుగు</span>
+                </div>
+              </div>
+
+              {/* Dynamic Live Location Badge */}
+              <div className="bg-slate-50 border border-slate-300 rounded-lg p-3.5 mb-5 flex items-start justify-between gap-3">
+                <div className="flex items-start gap-2.5">
+                  <MapPin className="w-5 h-5 text-red-600 mt-0.5 shrink-0" />
+                  <div className="text-xs">
+                    <span className="font-bold text-slate-800">Current Detected Location: </span>
+                    <span className="text-slate-700 font-semibold block mt-0.5">{locationName}</span>
+                    <span className="text-[11px] text-slate-500 font-mono mt-0.5 block">
+                      GPS: {coords.lat.toFixed(4)}° N, {coords.lng.toFixed(4)}° E
+                    </span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={detectLiveLocation}
+                  disabled={locating}
+                  className="p-1.5 bg-white hover:bg-slate-100 border border-slate-300 rounded text-slate-600 text-xs font-bold transition flex items-center gap-1 shrink-0"
+                  title="Re-fetch Current GPS Location"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${locating ? 'animate-spin' : ''}`} />
+                  <span className="hidden sm:inline">Refresh GPS</span>
+                </button>
+              </div>
+
+              {/* Mobile Input */}
+              <div className="mb-5 space-y-1.5">
+                <label className="block text-xs font-bold uppercase tracking-wider text-slate-700">
+                  Citizen Mobile Number (For SMS Tracking & Feedback) <span className="text-red-500">*</span>
+                </label>
+                <div className="relative">
+                  <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center text-slate-500 text-sm font-bold">
+                    +91
+                  </span>
+                  <input
+                    type="text"
+                    value={phone}
+                    onChange={(e) => setPhone(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-300 rounded-lg pl-12 pr-4 py-3 text-base font-bold text-slate-900 focus:bg-white focus:border-[#0b3c5d] outline-none"
+                    placeholder="Enter 10-digit number"
+                  />
+                </div>
+              </div>
+
+              {/* Error Box */}
+              {errorMsg && (
+                <div className="mb-5 p-3.5 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2.5 text-xs text-red-700 font-semibold">
+                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                  <span>{errorMsg}</span>
+                </div>
+              )}
+
+              {/* Voice Action Button */}
+              {!isRecording ? (
+                <button
+                  onClick={startVoiceCapture}
+                  disabled={isProcessing}
+                  className="w-full py-4 rounded-lg bg-[#0b3c5d] hover:bg-[#07273d] text-white font-bold text-base flex items-center justify-center gap-2 shadow-md transition disabled:opacity-50"
+                >
+                  <Mic className="w-5 h-5 text-emerald-300" />
+                  {isProcessing ? "Processing Speech via Speech Engine..." : "Start Voice Recording"}
+                </button>
+              ) : (
+                <button
+                  onClick={stopVoiceCapture}
+                  className="w-full py-4 rounded-lg bg-red-600 hover:bg-red-700 text-white font-bold text-base flex items-center justify-center gap-2 shadow-md animate-pulse"
+                >
+                  <MicOff className="w-5 h-5" />
+                  Stop Recording & Submit Complaint
+                </button>
+              )}
+
+              {/* Result Receipt Card */}
+              {createdTicket && (
+                <div className="mt-6 p-4 rounded-lg bg-emerald-50 border border-emerald-300 text-xs">
+                  <div className="flex items-center justify-between pb-2 border-b border-emerald-300 mb-2">
+                    <span className="flex items-center gap-1.5 text-emerald-900 font-bold">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600" /> Grievance Registered Successfully
+                    </span>
+                    <span className="font-mono bg-white text-emerald-900 px-2.5 py-0.5 rounded border border-emerald-300 font-bold text-sm">
+                      #{createdTicket.ticket_id}
+                    </span>
+                  </div>
+                  <p className="text-slate-800 mb-3 leading-relaxed font-medium">
+                    <strong>Official Summary:</strong> {createdTicket.summary}
+                  </p>
+                  <a
+                    href={`/track/${createdTicket.ticket_id}`}
+                    className="w-full py-2.5 bg-[#0b3c5d] hover:bg-[#07273d] text-white rounded-md flex items-center justify-center gap-1.5 font-bold transition shadow-sm text-xs"
+                  >
+                    View Official Status & Audit Trail <ArrowRight className="w-4 h-4" />
+                  </a>
+                </div>
+              )}
+
             </div>
-          )}
+          </div>
 
         </div>
       </main>
 
-      {/* Footer */}
-      <footer className="w-full text-center py-3 text-[11px] text-slate-600 border-t border-slate-900">
-        Municipal Corporation Automated Citizen Grievance Redressal System
+      {/* Official Government Footer */}
+      <footer className="bg-white border-t border-slate-200 py-6 text-center text-xs text-slate-500 font-medium">
+        <div className="max-w-6xl mx-auto px-4 flex flex-col md:flex-row items-center justify-between gap-2">
+          <p>© 2026 Municipal Grievance Redressal Engine. Official Public Portal.</p>
+          <div className="flex gap-4 text-slate-600">
+            <span>Citizen Charter</span>
+            <span>Privacy Policy</span>
+            <span>Terms of Redressal</span>
+          </div>
+        </div>
       </footer>
 
     </div>

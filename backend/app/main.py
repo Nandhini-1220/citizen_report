@@ -1,4 +1,8 @@
-import os
+import io
+from fastapi.responses import StreamingResponse
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
 import io
 import re
 import tempfile
@@ -615,68 +619,58 @@ def get_live_feed(db: Session = Depends(get_db)):
 
 
 @app.post("/api/reports/generate")
-def generate_audit_report(payload: ReportRequest, db: Session = Depends(get_db)):
-    complaints = db.query(Complaint).order_by(Complaint.created_at.desc()).all()
-
+def generate_audit_report(db: Session = Depends(get_db)):
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
 
-    # Document Title & Metadata Header
+    # Title & Header
     pdf.setFont("Helvetica-Bold", 16)
-    pdf.drawString(50, 750, "Municipal Grievance Intelligence & Audit Report")
+    pdf.drawString(50, height - 50, "MUNICIPAL GRIEVANCE AUDIT REPORT")
+    
+    pdf.setFont("Helvetica", 10)
+    pdf.drawString(50, height - 70, "Automated Public Redressal & Field Operations Ledger")
+    
+    # Divider line
+    pdf.setStrokeColor(colors.HexColor("#0B3C5D"))
+    pdf.setLineWidth(1.5)
+    pdf.line(50, height - 80, width - 50, height - 80)
+
+    # Fetch recent complaints
+    complaints = db.query(Complaint).order_by(Complaint.created_at.desc()).limit(25).all()
+
+    y = height - 110
+    pdf.setFont("Helvetica-Bold", 10)
+    pdf.drawString(50, y, "Ticket ID")
+    pdf.drawString(130, y, "Department")
+    pdf.drawString(250, y, "Priority")
+    pdf.drawString(330, y, "Status")
+    pdf.drawString(420, y, "Callers")
+    
+    y -= 15
+    pdf.setLineWidth(0.5)
+    pdf.setStrokeColor(colors.gray)
+    pdf.line(50, y + 5, width - 50, y + 5)
 
     pdf.setFont("Helvetica", 9)
-    pdf.drawString(
-        50, 735,
-        f"Generated On: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} | Total Incidents: {len(complaints)}"
-    )
-    pdf.line(50, 725, 560, 725)
-
-    # Table Column Headers
-    y = 705
-    pdf.setFont("Helvetica-Bold", 8)
-    pdf.drawString(50, y, "TICKET")
-    pdf.drawString(110, y, "CATEGORY")
-    pdf.drawString(220, y, "PRIORITY")
-    pdf.drawString(280, y, "STATUS")
-    pdf.drawString(340, y, "CALLERS")
-    pdf.drawString(390, y, "OFFICER")
-    pdf.drawString(490, y, "RATING")
-    pdf.line(50, y - 5, 560, y - 5)
-    y -= 18
-
-    # Table Rows
-    pdf.setFont("Helvetica", 7.5)
     for c in complaints:
         if y < 60:
             pdf.showPage()
-            y = 750
-            pdf.setFont("Helvetica-Bold", 8)
-            pdf.drawString(50, y, "TICKET")
-            pdf.drawString(110, y, "CATEGORY")
-            pdf.drawString(220, y, "PRIORITY")
-            pdf.drawString(280, y, "STATUS")
-            pdf.drawString(340, y, "CALLERS")
-            pdf.drawString(390, y, "OFFICER")
-            pdf.drawString(490, y, "RATING")
-            pdf.line(50, y - 5, 560, y - 5)
-            y -= 18
-            pdf.setFont("Helvetica", 7.5)
+            y = height - 50
+            pdf.setFont("Helvetica", 9)
 
-        rating_str = f"{c.rating} / 5" if getattr(c, "rating", None) else "Pending"
-        officer_str = (c.assigned_officer or "Unassigned")[:16]
-
+        dept_name = c.department.name if hasattr(c.department, 'name') else str(c.department or "General")
+        
         pdf.drawString(50, y, f"#{c.ticket_id}")
-        pdf.drawString(110, y, str(c.category)[:20])
-        pdf.drawString(220, y, str(c.urgency))
-        pdf.drawString(280, y, str(c.status))
-        pdf.drawString(340, y, str(c.report_count))
-        pdf.drawString(390, y, officer_str)
-        pdf.drawString(490, y, rating_str)
-        y -= 15
+        pdf.drawString(130, y, str(dept_name)[:18])
+        pdf.drawString(250, y, str(c.urgency or "Normal"))
+        pdf.drawString(330, y, str(c.status or "REGISTERED"))
+        pdf.drawString(420, y, str(getattr(c, 'report_count', 1)))
+        y -= 20
 
     pdf.save()
     buffer.seek(0)
+
     return StreamingResponse(
         buffer,
         media_type="application/pdf",

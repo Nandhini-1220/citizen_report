@@ -4,28 +4,45 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --gov-blue: #0b3c5d;
+  --gov-gold: #c08a3e;
+  --gov-bg: #f4f6f9;
+}
 
-/* Leaflet dark theme tweaks & container sizing */
+body {
+  margin: 0;
+  background-color: var(--gov-bg);
+  color: #1e293b;
+  font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  min-height: 100vh;
+}
+
+/* Crisp Clean Government Table Styling */
+.gov-table th {
+  background-color: #f8fafc;
+  color: #334155;
+  font-weight: 600;
+  border-bottom: 2px solid #e2e8f0;
+}
+
+.gov-table td {
+  border-bottom: 1px solid #f1f5f9;
+}
+
+/* Light Mode Leaflet Map Styling */
 .leaflet-container {
   width: 100%;
   height: 100%;
-  border-radius: 1rem;
-  background-color: #0f172a !important;
-  z-index: 1;
+  border-radius: 8px;
+  border: 1px solid #cbd5e1;
+  background: #f8fafc !important;
 }
 
-/* Custom scrollbar for dark mode */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-::-webkit-scrollbar-track {
-  background: #020617;
-}
-::-webkit-scrollbar-thumb {
-  background: #1e293b;
-  border-radius: 4px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: #334155;
+.leaflet-popup-content-wrapper {
+  background: #ffffff !important;
+  color: #0f172a !important;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px !important;
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1) !important;
 }

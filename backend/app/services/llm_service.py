@@ -79,14 +79,14 @@ Return ONLY a raw JSON object with these exact keys:
 
     try:
         chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Citizen Voice Transcript:\n\"\"\"{transcript}\"\"\""}
-            ],
-            model="llama-3.1-8b-instant",
-            temperature=0.1,
-            response_format={"type": "json_object"}
-        )
+    messages=[
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Citizen Voice Transcript:\n\"\"\"{transcript}\"\"\""}
+    ],
+    model="openai/gpt-oss-20b",
+    temperature=0.1,
+    response_format={"type": "json_object"}
+)
 
         content = chat_completion.choices[0].message.content
         return json.loads(content)
